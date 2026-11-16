@@ -338,6 +338,7 @@ internal static class CoopManager
     {
         var s = Session;
         Trade.Reset(); // while the session (names) and the shells are still there
+        GroupLoot.Reset();
         Session = null;
         Mode = CoopMode.Off;
         Busy = false;

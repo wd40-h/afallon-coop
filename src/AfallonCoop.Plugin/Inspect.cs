@@ -154,6 +154,7 @@ internal static class Inspect
     }
 
     private static MobCombatEntity _shown;
+    private static NpcInspectPanel _panel; // cached: no scene scan per frame
 
     /// <summary>The inspect window closed: the item data made for it goes.</summary>
     public static void Update()
@@ -161,7 +162,8 @@ internal static class Inspect
         if (_shown == null) return;
         try
         {
-            var panel = UnityEngine.Object.FindObjectOfType<NpcInspectPanel>(true);
+            if (_panel == null) _panel = UnityEngine.Object.FindObjectOfType<NpcInspectPanel>(true);
+            var panel = _panel;
             if (panel != null && panel.IsOpen() && panel.InspectedEntity != null && panel.InspectedEntity.Pointer == _shown.Pointer) return;
         }
         catch { }

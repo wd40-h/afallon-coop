@@ -57,9 +57,10 @@ internal static class Trade
     private static bool _rebuilding;
 
     // host: exchanges in progress
-    private sealed class Commit { public byte A, B; public bool OkA, OkB; }
+    private sealed class Commit { public byte A, B; public bool OkA, OkB; public float At; }
+    private const float CommitTimeout = 20f, RefundedKeep = 120f; // host: a side that never answers; how long a refund is remembered
     private static readonly Dictionary<uint, Commit> Commits = new();
-    private static readonly HashSet<uint> Refunded = new(); // a side that takes its offer out later gets it back too
+    private static readonly Dictionary<uint, float> Refunded = new(); // a side that takes its offer out later gets it back too
 
     private static readonly NetWriter W = new();
     private static readonly System.Random Rng = new();
@@ -456,8 +457,9 @@ internal static class Trade
     {
         if (_devStall) return; // dev: a host that never gets to finish it (gone, crashed)
         // the other side already left (before any of it reached me): nobody will answer for it
-        if (Refunded.Contains(id) || !CoopManager.Session.Players.ContainsKey(other)) { Finish(id, OpRefund); return; }
-        if (!Commits.TryGetValue(id, out var c)) Commits[id] = c = new Commit { A = from, B = other };
+        if (Refunded.ContainsKey(id) || !CoopManager.Session.Players.ContainsKey(other)) { Finish(id, OpRefund); return; }
+        if (!Commits.TryGetValue(id, out var c)) Commits[id] = c = new Commit { A = from, B = other, At = Time.unscaledTime };
+        else if (from != c.A && from != c.B) return; // only the two sides answer
         if (!ok) { Finish(id, OpRefund); return; }
         if (from == c.A) c.OkA = true; else c.OkB = true;
         if (c.OkA && c.OkB) Finish(id, OpDeliver);
@@ -466,7 +468,7 @@ internal static class Trade
     private static void Finish(uint id, byte op)
     {
         Commits.Remove(id);
-        if (op == OpRefund) Refunded.Add(id);
+        if (op == OpRefund) Refunded[id] = Time.unscaledTime;
         Header(op, id, 255);
         CoopManager.Session.SendWorld(W.Span);
         Plugin.L.LogInfo($"Trade {id:x8}: {(op == OpDeliver ? "deliver" : "refund")}");
@@ -570,8 +572,21 @@ internal static class Trade
 
     // ---------------- every frame ----------------
 
+    /// <summary>Host: a stuck exchange (a side never answered) is refunded; old refunds are forgotten.</summary>
+    private static void Expire()
+    {
+        if (Commits.Count == 0 && Refunded.Count == 0) return;
+        float now = Time.unscaledTime;
+        List<uint> stuck = null, old = null;
+        foreach (var kv in Commits) if (now - kv.Value.At > CommitTimeout) (stuck ??= new()).Add(kv.Key);
+        foreach (var kv in Refunded) if (now - kv.Value > RefundedKeep) (old ??= new()).Add(kv.Key);
+        if (stuck != null) foreach (var id in stuck) { Plugin.L.LogWarning($"Trade {id:x8}: no answer, refund"); Finish(id, OpRefund); }
+        if (old != null) foreach (var id in old) Refunded.Remove(id);
+    }
+
     public static void Update()
     {
+        if (CoopManager.Session is { IsHost: true }) Expire();
         if (_asked != 0 && Time.unscaledTime - _askedAt > RequestTimeout) { _asked = 0; Hud.Notify("Trade request expired"); }
         var d = _deal;
         if (d == null) return;

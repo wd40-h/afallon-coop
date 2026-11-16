@@ -29,12 +29,17 @@ internal static class MeterSync
     private static float _remoteAt = -100f, _nextRows, _nextBeat;
     private const float GroupCalm = 3f; // no report from the group this long: they are out of combat
     private static DPSMeterManager _meter;
+    private static float _nextFind;
 
     private static DPSMeterManager Meter
     {
         get
         {
-            if (_meter == null) try { _meter = UnityEngine.Object.FindObjectOfType<DPSMeterManager>(true); } catch { }
+            if (_meter == null && Time.unscaledTime >= _nextFind) // throttled: no scene scan per frame when absent
+            {
+                _nextFind = Time.unscaledTime + 2f;
+                try { _meter = UnityEngine.Object.FindObjectOfType<DPSMeterManager>(true); } catch { }
+            }
             return _meter;
         }
     }
@@ -75,6 +80,8 @@ internal static class MeterSync
     public static void Receive(byte from, ref NetReader r)
     {
         float theirElapsed = r.F32();
+        if (!(theirElapsed >= 0f)) theirElapsed = 0f; // NaN or negative
+        else if (theirElapsed > 3600f) theirElapsed = 3600f; // an hour at most
         int n = r.U8();
         var s = CoopManager.Session;
         bool group = s != null && s.InSameGroup(s.LocalId, from);

@@ -43,7 +43,7 @@ internal static class PlayerShells
         if (!CoopManager.Connected || !GameInfo.InWorld) { Clear(); return; }
         if (Dungeons.Place != _scene) { Clear(); _scene = Dungeons.Place; }
 
-        var seen = new HashSet<byte>();
+        var seen = Seen; seen.Clear();
         foreach (var (id, tr) in Puppets.Visible())
         {
             seen.Add(id);
@@ -62,9 +62,13 @@ internal static class PlayerShells
             bool dead = Puppets.IsDead(id);
             if (shell.Dead != dead) { shell.Dead = dead; Plugin.L.LogInfo($"Player shell #{id}: {(dead ? "dead" : "alive")}"); }
         }
-        foreach (var id in new List<byte>(ByPlayer.Keys))
-            if (!seen.Contains(id)) Remove(id);
+        Gone.Clear();
+        foreach (var id in ByPlayer.Keys) if (!seen.Contains(id)) Gone.Add(id);
+        foreach (var id in Gone) Remove(id);
     }
+
+    private static readonly HashSet<byte> Seen = new(); // reused per frame
+    private static readonly List<byte> Gone = new();
 
     private static MobCombatEntity Spawn(byte id, Transform at)
     {

@@ -1528,6 +1528,7 @@ internal static class MobSync
         foreach (var c in new List<Copy>(Copies.Values)) DestroyCopy(c);
         Copies.Clear(); CopyPtrs.Clear(); OwnedByPtr.Clear(); Interest.Clear(); Participants.Clear(); PhasedNpcs.Clear(); PhasedAt.Clear();
         Spawners.Clear(); KeyOf.Clear(); Zones.Clear(); ZoneKeyOf.Clear(); _scene = "";
+        SuppressedPets.Clear(); ResurrectOffered.Clear(); RecruitedBy.Clear();
     }
 
     /// <summary>Dev: the local player hits the nearest synced mob through the game's own damage path.</summary>

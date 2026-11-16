@@ -206,10 +206,10 @@ internal static class GroupLoot
         var items = new List<(int id, int count, byte[] data)>();
         for (int i = 0; i < n; i++) items.Add((r.I32(), r.I32(), r.Blob()));
         if (SeenMobs.ContainsKey(mob)) return; // someone's report already counts for this kill
-        SeenMobs[mob] = Time.unscaledTime;
         var s = CoopManager.Session;
         var g = s.GroupOf(from);
-        if (g == null || !s.Players.TryGetValue(from, out var finder)) return;
+        if (g == null || !s.Players.TryGetValue(from, out var finder)) return; // not counted: a grouped report may follow
+        SeenMobs[mob] = Time.unscaledTime;
         float timer = 60f;
         try { timer = GameDatabase.Instance.GetEconomySettings().RollTimerDuration; } catch { }
         foreach (var (id, count, data) in items)
@@ -246,12 +246,29 @@ internal static class GroupLoot
             _nextSettings = Time.unscaledTime + 10f;
             foreach (var kv in Masks) { W.Reset(); W.U8(Kind); W.U8(OpSettings); W.U8(kv.Key); W.I32(kv.Value); _relaying = true; try { s.SendWorld(W.Span); } finally { _relaying = false; } }
         }
+        PruneSeen();
         if (Rolls.Count == 0) return;
         List<Roll> due = null;
         foreach (var r in Rolls.Values) if (Time.unscaledTime > r.Deadline) (due ??= new()).Add(r);
         if (due != null) foreach (var r in due) { foreach (var p in r.Waiting) r.Entries.Add((p, -1, Groups.Name(p), Pass, 0)); r.Waiting.Clear(); Resolve(r); }
-        if (SeenMobs.Count > 200) // only old kills go: a late report of a recent one must still find it
-            foreach (var k in new List<uint>(SeenMobs.Keys)) if (Time.unscaledTime - SeenMobs[k] > 120f) SeenMobs.Remove(k);
+    }
+
+    /// <summary>Only old kills go: a late report of a recent one must still find it.</summary>
+    private static void PruneSeen()
+    {
+        if (SeenMobs.Count <= 200) return;
+        foreach (var k in new List<uint>(SeenMobs.Keys)) if (Time.unscaledTime - SeenMobs[k] > 120f) SeenMobs.Remove(k);
+    }
+
+    /// <summary>Session over: open windows, their temp data and the host's rolls go.</summary>
+    public static void Reset()
+    {
+        foreach (var m in new List<Mine>(Open.Values))
+        {
+            if (m.Entry != null) CloseSlot(m);
+            ItemData.DropTemps("roll" + m.Id);
+        }
+        Open.Clear(); Rolls.Clear(); SeenMobs.Clear();
     }
 
     /// <summary>The game's rule: a need beats a greed, then the highest roll (the first of equals); no one: gone.</summary>

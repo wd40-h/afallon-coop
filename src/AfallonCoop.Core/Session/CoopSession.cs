@@ -4,68 +4,48 @@ using AfallonCoop.World;
 
 namespace AfallonCoop.Session;
 
-public sealed class SessionConfig
-{
-    public string ModVersion = "";
-    public string GameBuild = "";
-    public string PlayerName = "Player";
-    public ulong SteamId;
-    /// <summary>This install's own random id (see <see cref="HelloMsg.ClientId"/>).</summary>
-    public string ClientId = "";
-    /// <summary>Host: players must give it to join (empty = anyone). Client: the one given.</summary>
-    public string Password = "";
-}
-
-public enum SessionState { Connecting, Handshaking, Connected, Closed }
-
-/// <summary>A member of a group: a player, online (with their session id) or waiting to reconnect.</summary>
-public sealed class GroupMemberInfo
-{
-    public string Key = "";
-    public string Name = "";
-    public byte Id = GroupRegistry.Offline;
-    public int Bots;
-    public bool Online => Id != GroupRegistry.Offline;
-}
-
-/// <summary>A player group as everyone sees it (decided by the host).</summary>
-public sealed class GroupInfo
-{
-    public byte Id;
-    public string LeaderKey = "";
-    /// <summary>In group order, including members who are disconnected (their place is kept).</summary>
-    public readonly List<GroupMemberInfo> Members = new();
-    public GroupMemberInfo LeaderMember => Members.FirstOrDefault(m => m.Key == LeaderKey);
-    /// <summary>Session id of the leader, <see cref="GroupRegistry.Offline"/> while they are disconnected.</summary>
-    public byte Leader => LeaderMember?.Id ?? GroupRegistry.Offline;
-    /// <summary>Members online, by session id.</summary>
-    public IEnumerable<byte> Players => Members.Where(m => m.Online).Select(m => m.Id);
-    public GroupMemberInfo Member(byte id) => Members.FirstOrDefault(m => m.Online && m.Id == id);
-    public int Size => Members.Count + Members.Sum(m => m.Bots);
-}
-
 /// <summary>
 /// Star topology: clients talk only to the host, the host relays. Host is player id 0.
 /// Everything happens inside <see cref="Tick"/> on the caller's thread.
 /// </summary>
 public sealed class CoopSession : IDisposable
 {
-    private const double HelloTimeout = 10;
+    private const int MaxPayloadBytes = 4000;
+    private const int MaxChatLength = 300;
+    private const int BotCountUnknown = -1;
 
-    private readonly ITransport _t;
-    private readonly SessionConfig _cfg;
+    private delegate void HostHandler(MsgType type, int connection, byte sender, ref NetReader reader);
+    private delegate void ClientHandler(MsgType type, ref NetReader reader);
+
+    private readonly ITransport _transport;
+    private readonly SessionConfig _config;
     private readonly Func<double> _clock;
-    private readonly NetWriter _w = new();
 
-    // host side
-    private readonly Dictionary<int, byte> _connToPlayer = new();
-    private readonly Dictionary<int, double> _awaitingHello = new();
+    private readonly HostPeers _peers = new();
+    private readonly Outbox _outbox;
+    private readonly PlayerKeys _playerKeys = new();
+    private readonly PauseController _pause = new();
+    private readonly GroupDirectory _groups = new();
+    private readonly GroupRegistry _groupRegistry = new();
+    private readonly LeaseRegistry _leases = new();
+    private readonly LeaseView _leaseView = new();
+    private readonly HashSet<uint> _interest = new();
+    private readonly Dictionary<uint, bool> _leaseCombat = new();
+    private readonly Dictionary<byte, Place> _lastPlaceByPlayer = new();
+    private readonly Dictionary<string, Place> _placeByPlayerKey = new();
+    private readonly Dictionary<MsgType, HostHandler> _hostHandlers;
+    private readonly Dictionary<MsgType, ClientHandler> _clientHandlers;
+
+    private bool _localMenuOpen;
+    private int _reportedBots = BotCountUnknown;
+
+    private readonly record struct Place(int Scene, float X, float Y, float Z);
 
     public bool IsHost { get; }
     public byte LocalId { get; private set; }
     public SessionState State { get; private set; }
     public string Status { get; private set; } = "";
-    public string Transport => _t.Description;
+    public string Transport => _transport.Description;
     public readonly Dictionary<byte, PlayerInfo> Players = new();
 
     public event Action<PlayerInfo> PlayerJoined;
@@ -85,7 +65,6 @@ public sealed class CoopSession : IDisposable
     public event Action<bool, byte, int> PayloadSent;
     /// <summary>Spawner key, new owner (<see cref="LeaseRegistry.NoOwner"/> = dormant), epoch.</summary>
     public event Action<uint, byte, uint> LeaseChanged;
-
     /// <summary>Groups changed (someone joined, left, a new leader, bot counts).</summary>
     public event Action GroupsChanged;
     /// <summary>The local player is invited by this player.</summary>
@@ -99,113 +78,81 @@ public sealed class CoopSession : IDisposable
     /// <summary>A group member's message for the group (sender id, content), see <see cref="GroupCast"/>.</summary>
     public event Action<byte, byte[]> GroupMessage;
 
-    // where each player last was (host): a member who reconnects is sent back there
-    private readonly Dictionary<byte, (int scene, float x, float y, float z)> _lastPlace = new();
-    private readonly Dictionary<string, (int scene, float x, float y, float z)> _placeByKey = new();
+    /// <summary>Host: players kept out, by Steam account (0 = none) or install id; asked when someone says hello.</summary>
+    public Func<ulong, string, bool> IsBanned;
 
-    // groups: the host decides with the registry, everyone keeps the resulting list
-    private readonly GroupRegistry _groupReg = new();
-    private readonly List<GroupInfo> _groups = new();
-    public IReadOnlyList<GroupInfo> Groups => _groups;
-    public GroupInfo GroupOf(byte player) => _groups.FirstOrDefault(g => g.Member(player) != null);
-    public GroupInfo MyGroup => GroupOf(LocalId);
-    public bool InSameGroup(byte a, byte b) { var g = GroupOf(a); return g != null && g.Member(b) != null; }
-
-    // host: each player's identity across reconnects (Steam id, else the install's own id; never the name, which
-    // anyone can share)
-    private readonly Dictionary<byte, string> _playerKey = new();
-
-    private string KeyOf(PlayerInfo p) => _playerKey.TryGetValue(p.Id, out var k) ? k : "player:" + p.Id;
-
-    /// <summary>
-    /// A player's identity kept across sessions (friends): their Steam account; their install's id when that account is
-    /// already here (two copies of one account) or unknown.
-    /// </summary>
-    private string LastingKey(byte id, ulong steamId, string clientId)
+    private CoopSession(ITransport transport, SessionConfig config, Func<double> clock, bool isHost)
     {
-        bool shared = Players.Values.Any(p => p.Id != id && p.SteamId == steamId);
-        if (steamId != 0 && !shared) return "steam:" + steamId;
-        return !string.IsNullOrEmpty(clientId) ? "client:" + clientId : "player:" + id;
-    }
-
-    private string MakeKey(byte id, ulong steamId, string clientId)
-    {
-        string key = steamId != 0 ? "steam:" + steamId : !string.IsNullOrEmpty(clientId) ? "client:" + clientId : "player:" + id;
-        // the same account or install twice at once (two copies on one PC): the second one is someone new
-        if (_playerKey.Values.Contains(key)) key += "#" + id;
-        _playerKey[id] = key;
-        return key;
-    }
-
-    // leases: the host decides with the registry, everyone keeps a view of the result
-    private readonly LeaseRegistry _leases = new();
-    private readonly Dictionary<uint, (byte owner, uint epoch)> _leaseView = new();
-    private readonly HashSet<uint> _interest = new();
-    private readonly Dictionary<uint, bool> _leaseCombat = new();
-
-    // pause: host decides; rule = host paused OR (2+ players and everyone has a menu open)
-    private readonly Dictionary<byte, bool> _menuOpen = new();
-    private bool _hostPause;
-    private bool _localMenuOpen;
-    public bool Paused { get; private set; }
-    public PauseReason PauseReason { get; private set; }
-    public bool HostPauseRequested => _hostPause;
-
-    private CoopSession(ITransport t, SessionConfig cfg, Func<double> clock, bool host)
-    {
-        _t = t; _cfg = cfg; _clock = clock; IsHost = host;
+        _transport = transport;
+        _config = config;
+        _clock = clock;
+        IsHost = isHost;
+        _outbox = new Outbox(transport, _peers, isHost);
+        _hostHandlers = CreateHostHandlers();
+        _clientHandlers = CreateClientHandlers();
         _leases.HostId = ProtocolInfo.HostId;
         _leases.OwnerChanged += OnLeaseOwnerChanged;
-        _groupReg.Changed += OnGroupsDecided;
-        _groupReg.Notice += (player, text) => ToPlayer(player, GroupOp.Notice, w => w.Str(text), () => GroupNotice?.Invoke(text));
-        _groupReg.InviteSent += (to, from) => ToPlayer(to, GroupOp.InvitedBy, w => w.U8(from), () => GroupInvited?.Invoke(from));
-        _groupReg.BotDismissed += (owner, npc) => ToPlayer(owner, GroupOp.BotDismissed, w => w.I32(npc), () => GroupBotDismissed?.Invoke(npc));
-        _groupReg.Rejoined += player =>
+        ListenToGroupRegistry();
+        _transport.Connected += OnConnected;
+        _transport.Disconnected += OnDisconnected;
+        _transport.Received += OnReceived;
+    }
+
+    public static CoopSession StartHost(ITransport transport, SessionConfig config, Func<double> clock)
+    {
+        var session = new CoopSession(transport, config, clock, isHost: true)
         {
-            if (!Players.TryGetValue(player, out var info) || !_placeByKey.TryGetValue(KeyOf(info), out var at)) return;
-            ToPlayer(player, GroupOp.ReturnTo, w => { w.I32(at.scene); w.F32(at.x); w.F32(at.y); w.F32(at.z); }, () => { });
+            LocalId = ProtocolInfo.HostId,
+            State = SessionState.Connected,
+            Status = "Hosting via " + transport.Description,
         };
-        _t.Connected += OnConnected;
-        _t.Disconnected += OnDisconnected;
-        _t.Received += OnReceived;
+        session.RegisterHostPlayer();
+        return session;
     }
 
-    public static CoopSession StartHost(ITransport t, SessionConfig cfg, Func<double> clock)
+    public static CoopSession StartClient(ITransport transport, SessionConfig config, Func<double> clock) =>
+        new(transport, config, clock, isHost: false)
+        {
+            State = SessionState.Connecting,
+            Status = "Connecting via " + transport.Description,
+        };
+
+    private void RegisterHostPlayer()
     {
-        var s = new CoopSession(t, cfg, clock, true) { LocalId = ProtocolInfo.HostId, State = SessionState.Connected };
-        s.Players[ProtocolInfo.HostId] = new PlayerInfo { Id = ProtocolInfo.HostId, Name = cfg.PlayerName, SteamId = cfg.SteamId, Key = s.LastingKey(ProtocolInfo.HostId, cfg.SteamId, cfg.ClientId) };
-        s._groupReg.PlayerOnline(ProtocolInfo.HostId, s.MakeKey(ProtocolInfo.HostId, cfg.SteamId, cfg.ClientId), cfg.PlayerName);
-        s.Status = "Hosting via " + t.Description;
-        return s;
+        var host = new PlayerInfo
+        {
+            Id = ProtocolInfo.HostId,
+            Name = _config.PlayerName,
+            SteamId = _config.SteamId,
+            Key = _playerKeys.Lasting(ProtocolInfo.HostId, _config.SteamId, _config.ClientId, Players.Values),
+        };
+        Players[host.Id] = host;
+        string groupKey = _playerKeys.Assign(host.Id, _config.SteamId, _config.ClientId);
+        _groupRegistry.PlayerOnline(host.Id, groupKey, _config.PlayerName);
     }
 
-    public static CoopSession StartClient(ITransport t, SessionConfig cfg, Func<double> clock)
-    {
-        var s = new CoopSession(t, cfg, clock, false) { State = SessionState.Connecting, Status = "Connecting via " + t.Description };
-        return s;
-    }
-
-    public PlayerInfo Local => Players.TryGetValue(LocalId, out var p) ? p : null;
+    public PlayerInfo Local => Players.TryGetValue(LocalId, out var player) ? player : null;
     public int PlayerCount => Players.Count;
-    public int PingToHost => IsHost ? 0 : _t.GetPing(ITransport.ServerConnection);
+    public int PingToHost => IsHost ? 0 : _transport.GetPing(ITransport.ServerConnection);
+
+    public bool Paused => _pause.Paused;
+    public PauseReason PauseReason => _pause.Reason;
+    public bool HostPauseRequested => _pause.HostRequested;
+
+    public IReadOnlyList<GroupInfo> Groups => _groups.All;
+    public GroupInfo GroupOf(byte player) => _groups.GroupOf(player);
+    public GroupInfo MyGroup => GroupOf(LocalId);
+    public bool InSameGroup(byte first, byte second) => _groups.AreInSameGroup(first, second);
 
     public void Tick()
     {
         if (State == SessionState.Closed) return;
-        _t.Poll();
-        if (IsHost) _leases.Tick(_clock());
-        if (IsHost && _awaitingHello.Count > 0)
-        {
-            double now = _clock();
-            foreach (var kv in _awaitingHello.Where(kv => now - kv.Value > HelloTimeout).ToList())
-            {
-                _awaitingHello.Remove(kv.Key);
-                _t.Disconnect(kv.Key, "handshake timeout");
-            }
-        }
+        _transport.Poll();
+        if (!IsHost) return;
+        _leases.Tick(_clock());
+        foreach (var connection in _peers.TakeTimedOutHandshakes(_clock()))
+            _transport.Disconnect(connection, "handshake timeout");
     }
-
-    // ---------------- outgoing ----------------
 
     /// <summary>Update what others know about us (character chosen, level, scene).</summary>
     public void UpdateLocalInfo(Action<PlayerInfo> change)
@@ -214,102 +161,48 @@ public sealed class CoopSession : IDisposable
         if (me == null) return;
         change(me);
         me.Id = LocalId;
-        if (IsHost) _groupReg.SetName(LocalId, me.CharacterName);
-        _w.Reset(); _w.U8((byte)MsgType.PlayerInfo); me.Write(_w);
-        if (IsHost) Broadcast(_w.Span, Delivery.Reliable, exceptConn: -1);
-        else _t.Send(ITransport.ServerConnection, _w.Span, Delivery.Reliable);
+        if (IsHost) _groupRegistry.SetName(LocalId, me.CharacterName);
+        me.Write(_outbox.Begin(MsgType.PlayerInfo));
+        _outbox.Publish(Delivery.Reliable);
     }
 
-    public void SendLocalState(PlayerStateMsg m)
+    public void SendLocalState(PlayerStateMsg state)
     {
         if (State != SessionState.Connected) return;
-        m.Id = LocalId;
-        _w.Reset(); m.Write(_w);
-        if (IsHost) Broadcast(_w.Span, Delivery.Unreliable, exceptConn: -1);
-        else _t.Send(ITransport.ServerConnection, _w.Span, Delivery.Unreliable);
+        state.Id = LocalId;
+        state.Write(_outbox.BeginUntyped());
+        _outbox.Publish(Delivery.Unreliable);
     }
 
     public void SendChat(string text)
     {
         if (State != SessionState.Connected || string.IsNullOrWhiteSpace(text)) return;
-        _w.Reset(); _w.U8((byte)MsgType.Chat); _w.U8(LocalId); _w.Str(text);
-        if (IsHost) Broadcast(_w.Span, Delivery.Reliable, exceptConn: -1);
-        else _t.Send(ITransport.ServerConnection, _w.Span, Delivery.Reliable);
+        var writer = _outbox.Begin(MsgType.Chat);
+        writer.U8(LocalId);
+        writer.Str(text);
+        _outbox.Publish(Delivery.Reliable);
         ChatReceived?.Invoke(LocalId, text);
-    }
-
-    /// <summary>Report whether the local player has a menu open (Esc menu, or not in the world).</summary>
-    public void SetLocalMenuOpen(bool open)
-    {
-        if (open == _localMenuOpen) return;
-        _localMenuOpen = open;
-        if (IsHost) { _menuOpen[LocalId] = open; RecomputePause(); }
-        else if (State == SessionState.Connected)
-        {
-            _w.Reset(); _w.U8((byte)MsgType.MenuState); _w.Bool(open);
-            _t.Send(ITransport.ServerConnection, _w.Span, Delivery.Reliable);
-        }
-    }
-
-    /// <summary>Host only: pause or resume the world for everyone.</summary>
-    public void SetHostPause(bool on)
-    {
-        if (!IsHost) return;
-        _hostPause = on;
-        RecomputePause();
-    }
-
-    private void RecomputePause()
-    {
-        bool allInMenu = Players.Count >= 2 && Players.Keys.All(id => _menuOpen.TryGetValue(id, out var m) && m);
-        var reason = _hostPause ? PauseReason.Host : allInMenu ? PauseReason.AllInMenu : PauseReason.None;
-        ApplyPause(reason != PauseReason.None, reason);
-    }
-
-    private void ApplyPause(bool paused, PauseReason reason)
-    {
-        if (paused == Paused && reason == PauseReason) return;
-        Paused = paused;
-        PauseReason = reason;
-        if (IsHost)
-        {
-            WritePauseState();
-            Broadcast(_w.Span, Delivery.Reliable, exceptConn: -1);
-        }
-        Log?.Invoke(paused ? $"World paused ({reason})" : "World resumed");
-        PauseChanged?.Invoke(paused, reason);
-    }
-
-    private void WritePauseState()
-    {
-        _w.Reset(); _w.U8((byte)MsgType.PauseState); _w.Bool(Paused); _w.U8((byte)PauseReason);
     }
 
     /// <summary>
     /// Send an effect played by the local character to everyone else. Unreliable is for streams where a lost packet
     /// is replaced by the next one (positions); events that happen once must be reliable.
     /// </summary>
-    public void SendFx(ReadOnlySpan<byte> payload, bool reliable = true)
-    {
-        if (State != SessionState.Connected || payload.Length == 0 || payload.Length > 4000) return;
-        var type = reliable ? MsgType.Fx : MsgType.FxStream;
-        var d = reliable ? Delivery.Reliable : Delivery.UnreliableUnordered;
-        PayloadSent?.Invoke(true, payload[0], payload.Length);
-        _w.Reset(); _w.U8((byte)type); _w.U8(LocalId); _w.Blob(payload);
-        if (IsHost) Broadcast(_w.Span, d, exceptConn: -1);
-        else _t.Send(ITransport.ServerConnection, _w.Span, d);
-    }
+    public void SendFx(ReadOnlySpan<byte> payload, bool reliable = true) =>
+        SendPayload(isFx: true, reliable ? MsgType.Fx : MsgType.FxStream, payload, reliable);
 
     /// <summary>World payload about objects the local player owns (see <see cref="WorldReceived"/>).</summary>
-    public void SendWorld(ReadOnlySpan<byte> payload, bool reliable = true)
+    public void SendWorld(ReadOnlySpan<byte> payload, bool reliable = true) =>
+        SendPayload(isFx: false, reliable ? MsgType.World : MsgType.WorldStream, payload, reliable);
+
+    private void SendPayload(bool isFx, MsgType type, ReadOnlySpan<byte> payload, bool reliable)
     {
-        if (State != SessionState.Connected || payload.Length == 0 || payload.Length > 4000) return;
-        var type = reliable ? MsgType.World : MsgType.WorldStream;
-        var d = reliable ? Delivery.Reliable : Delivery.UnreliableUnordered;
-        PayloadSent?.Invoke(false, payload[0], payload.Length);
-        _w.Reset(); _w.U8((byte)type); _w.U8(LocalId); _w.Blob(payload);
-        if (IsHost) Broadcast(_w.Span, d, exceptConn: -1);
-        else _t.Send(ITransport.ServerConnection, _w.Span, d);
+        if (!CanSendPayload(payload)) return;
+        PayloadSent?.Invoke(isFx, payload[0], payload.Length);
+        var writer = _outbox.Begin(type);
+        writer.U8(LocalId);
+        writer.Blob(payload);
+        _outbox.Publish(reliable ? Delivery.Reliable : Delivery.UnreliableUnordered);
     }
 
     /// <summary>
@@ -319,48 +212,100 @@ public sealed class CoopSession : IDisposable
     /// </summary>
     public void SendWorldStreamTo(byte player, ReadOnlySpan<byte> payload)
     {
-        if (State != SessionState.Connected || player == LocalId || payload.Length == 0 || payload.Length > 4000) return;
+        if (player == LocalId || !CanSendPayload(payload)) return;
         PayloadSent?.Invoke(false, payload[0], payload.Length);
-        _w.Reset();
-        if (IsHost)
-        {
-            int conn = ConnOf(player);
-            if (conn < 0) return;
-            _w.U8((byte)MsgType.WorldStream); _w.U8(LocalId); _w.Blob(payload);
-            _t.Send(conn, _w.Span, Delivery.UnreliableUnordered);
-        }
-        else
-        {
-            _w.U8((byte)MsgType.WorldStreamTo); _w.U8(LocalId); _w.U8(player); _w.Blob(payload);
-            _t.Send(ITransport.ServerConnection, _w.Span, Delivery.UnreliableUnordered);
-        }
+        if (IsHost) SendWorldStreamFromHost(player, payload);
+        else SendWorldStreamThroughHost(player, payload);
     }
 
-    /// <summary>Host: players kept out, by Steam account (0 = none) or install id; asked when someone says hello.</summary>
-    public Func<ulong, string, bool> IsBanned;
+    private void SendWorldStreamFromHost(byte player, ReadOnlySpan<byte> payload)
+    {
+        int connection = _peers.ConnectionOf(player);
+        if (connection < 0) return;
+        var writer = _outbox.Begin(MsgType.WorldStream);
+        writer.U8(LocalId);
+        writer.Blob(payload);
+        _outbox.To(connection, Delivery.UnreliableUnordered);
+    }
+
+    private void SendWorldStreamThroughHost(byte player, ReadOnlySpan<byte> payload)
+    {
+        var writer = _outbox.Begin(MsgType.WorldStreamTo);
+        writer.U8(LocalId);
+        writer.U8(player);
+        writer.Blob(payload);
+        _outbox.ToHost(Delivery.UnreliableUnordered);
+    }
+
+    private bool CanSendPayload(ReadOnlySpan<byte> payload) =>
+        State == SessionState.Connected && payload.Length > 0 && payload.Length <= MaxPayloadBytes;
 
     /// <summary>Host: send a player away, with the reason they see.</summary>
     public void Kick(byte player, string reason)
     {
-        int conn = IsHost ? ConnOf(player) : -1;
-        if (conn < 0) return;
-        _w.Reset(); _w.U8((byte)MsgType.Reject); _w.Str(reason);
-        _t.Send(conn, _w.Span, Delivery.Reliable);
-        _t.Disconnect(conn, reason);
+        int connection = IsHost ? _peers.ConnectionOf(player) : -1;
+        if (connection < 0) return;
+        _outbox.Begin(MsgType.Reject).Str(reason);
+        _outbox.To(connection, Delivery.Reliable);
+        _transport.Disconnect(connection, reason);
     }
 
-    private int ConnOf(byte player)
+    /// <summary>Report whether the local player has a menu open (Esc menu, or not in the world).</summary>
+    public void SetLocalMenuOpen(bool open)
     {
-        foreach (var kv in _connToPlayer) if (kv.Value == player) return kv.Key;
-        return -1;
+        if (open == _localMenuOpen) return;
+        _localMenuOpen = open;
+        if (IsHost) ReportHostMenu(open);
+        else if (State == SessionState.Connected) SendMenuStateToHost(open);
     }
 
-    // ---------------- leases ----------------
+    private void ReportHostMenu(bool open)
+    {
+        _pause.SetMenuOpen(LocalId, open);
+        RecomputePause();
+    }
 
-    private static string LeaseKey(uint key) => key.ToString("x8");
+    private void SendMenuStateToHost(bool open)
+    {
+        _outbox.Begin(MsgType.MenuState).Bool(open);
+        _outbox.ToHost(Delivery.Reliable);
+    }
+
+    /// <summary>Host only: pause or resume the world for everyone.</summary>
+    public void SetHostPause(bool on)
+    {
+        if (!IsHost) return;
+        _pause.HostRequested = on;
+        RecomputePause();
+    }
+
+    private void RecomputePause()
+    {
+        var reason = _pause.Decide(Players.Keys);
+        ApplyPause(reason != PauseReason.None, reason);
+    }
+
+    private void ApplyPause(bool paused, PauseReason reason)
+    {
+        if (!_pause.Apply(paused, reason)) return;
+        if (IsHost)
+        {
+            WritePauseState();
+            _outbox.ToEveryone(Delivery.Reliable);
+        }
+        Log?.Invoke(paused ? $"World paused ({reason})" : "World resumed");
+        PauseChanged?.Invoke(paused, reason);
+    }
+
+    private void WritePauseState()
+    {
+        var writer = _outbox.Begin(MsgType.PauseState);
+        writer.Bool(_pause.Paused);
+        writer.U8((byte)_pause.Reason);
+    }
 
     /// <summary>Who simulates spawner <paramref name="key"/>; <see cref="LeaseRegistry.NoOwner"/> if nobody or unknown yet.</summary>
-    public byte LeaseOwner(uint key) => _leaseView.TryGetValue(key, out var v) ? v.owner : LeaseRegistry.NoOwner;
+    public byte LeaseOwner(uint key) => _leaseView.OwnerOf(key);
     public int LeaseCount => _leaseView.Count;
 
     /// <summary>The local player came near spawner <paramref name="key"/> (or left it). The host assigns an owner.</summary>
@@ -368,81 +313,99 @@ public sealed class CoopSession : IDisposable
     /// mobs are gone on this machine, so a fight cannot stay with it; the lease moves at once.</param>
     public void SetInterest(uint key, bool near, bool leftPlace = false)
     {
-        if (near ? !_interest.Add(key) : !_interest.Remove(key)) return;
-        if (IsHost)
-        {
-            if (near) _leases.Subscribe(LocalId, LeaseKey(key), _clock());
-            else _leases.Unsubscribe(LocalId, LeaseKey(key), _clock(), leftPlace);
-        }
+        bool changed = near ? _interest.Add(key) : _interest.Remove(key);
+        if (!changed) return;
+        if (IsHost) ReportHostInterest(key, near, leftPlace);
         else if (State == SessionState.Connected) SendInterest(key, near, leftPlace);
+    }
+
+    private void ReportHostInterest(uint key, bool near, bool leftPlace)
+    {
+        if (near) _leases.Subscribe(LocalId, FormatLeaseKey(key), _clock());
+        else _leases.Unsubscribe(LocalId, FormatLeaseKey(key), _clock(), leftPlace);
     }
 
     private void SendInterest(uint key, bool near, bool leftPlace = false)
     {
-        _w.Reset(); _w.U8((byte)MsgType.Interest); _w.U32(key); _w.Bool(near); _w.Bool(leftPlace);
-        _t.Send(ITransport.ServerConnection, _w.Span, Delivery.Reliable);
+        var writer = _outbox.Begin(MsgType.Interest);
+        writer.U32(key);
+        writer.Bool(near);
+        writer.Bool(leftPlace);
+        _outbox.ToHost(Delivery.Reliable);
     }
 
     /// <summary>Owner side: is anything from this spawner fighting (ownership does not move during a fight).</summary>
     public void ReportLeaseCombat(uint key, bool inCombat)
     {
-        if (_leaseCombat.TryGetValue(key, out var was) && was == inCombat) return;
+        if (_leaseCombat.TryGetValue(key, out var wasInCombat) && wasInCombat == inCombat) return;
         _leaseCombat[key] = inCombat;
-        if (IsHost) _leases.SetCombat(LocalId, LeaseKey(key), inCombat, _clock());
-        else if (State == SessionState.Connected)
-        {
-            _w.Reset(); _w.U8((byte)MsgType.LeaseCombat); _w.U32(key); _w.Bool(inCombat);
-            _t.Send(ITransport.ServerConnection, _w.Span, Delivery.Reliable);
-        }
+        if (IsHost) _leases.SetCombat(LocalId, FormatLeaseKey(key), inCombat, _clock());
+        else if (State == SessionState.Connected) SendLeaseCombat(key, inCombat);
     }
 
-    private void OnLeaseOwnerChanged(LeaseRegistry.Lease l, string reason)
+    private void SendLeaseCombat(uint key, bool inCombat)
     {
-        uint key = Convert.ToUInt32(l.Key, 16);
-        Log?.Invoke($"Spawner {l.Key}: owner {(l.Owner == LeaseRegistry.NoOwner ? "none" : "#" + l.Owner)} ({reason})");
-        WriteLeaseOwner(key, l.Owner, l.Epoch);
-        Broadcast(_w.Span, Delivery.Reliable, exceptConn: -1);
-        ApplyLeaseOwner(key, l.Owner, l.Epoch);
+        var writer = _outbox.Begin(MsgType.LeaseCombat);
+        writer.U32(key);
+        writer.Bool(inCombat);
+        _outbox.ToHost(Delivery.Reliable);
+    }
+
+    private void OnLeaseOwnerChanged(LeaseRegistry.Lease lease, string reason)
+    {
+        uint key = Convert.ToUInt32(lease.Key, 16);
+        string owner = lease.Owner == LeaseRegistry.NoOwner ? "none" : "#" + lease.Owner;
+        Log?.Invoke($"Spawner {lease.Key}: owner {owner} ({reason})");
+        WriteLeaseOwner(key, lease.Owner, lease.Epoch);
+        _outbox.ToEveryone(Delivery.Reliable);
+        ApplyLeaseOwner(key, lease.Owner, lease.Epoch);
     }
 
     private void WriteLeaseOwner(uint key, byte owner, uint epoch)
     {
-        _w.Reset(); _w.U8((byte)MsgType.LeaseOwner); _w.U32(key); _w.U8(owner); _w.U32(epoch);
+        var writer = _outbox.Begin(MsgType.LeaseOwner);
+        writer.U32(key);
+        writer.U8(owner);
+        writer.U32(epoch);
     }
 
     private void ApplyLeaseOwner(uint key, byte owner, uint epoch)
     {
-        if (_leaseView.TryGetValue(key, out var v) && v.epoch >= epoch) return; // stale or repeated
-        _leaseView[key] = (owner, epoch);
+        if (!_leaseView.TryUpdate(key, owner, epoch)) return;
         if (owner != LocalId) _leaseCombat.Remove(key);
         LeaseChanged?.Invoke(key, owner, epoch);
     }
 
-    // ---------------- groups ----------------
+    private static string FormatLeaseKey(uint key) => key.ToString("x8");
 
-    public void GroupInvite(byte target) => GroupRequest(GroupOp.Invite, w => w.U8(target));
-    public void GroupAnswer(bool accept) => GroupRequest(GroupOp.Answer, w => w.Bool(accept));
-    public void GroupLeave() => GroupRequest(GroupOp.Leave, _ => { });
-    public void GroupKick(string memberKey) => GroupRequest(GroupOp.Kick, w => w.Str(memberKey));
-    public void GroupKick(byte target) { var m = MyGroup?.Member(target); if (m != null) GroupKick(m.Key); }
-    public void GroupPromote(byte target) => GroupRequest(GroupOp.Promote, w => w.U8(target));
-    public void GroupDismissBot(byte owner, int npcId) => GroupRequest(GroupOp.DismissBot, w => { w.U8(owner); w.I32(npcId); });
+    public void GroupInvite(byte target) => RequestGroupOp(GroupOp.Invite, w => w.U8(target));
+    public void GroupAnswer(bool accept) => RequestGroupOp(GroupOp.Answer, w => w.Bool(accept));
+    public void GroupLeave() => RequestGroupOp(GroupOp.Leave, _ => { });
+    public void GroupKick(string memberKey) => RequestGroupOp(GroupOp.Kick, w => w.Str(memberKey));
+    public void GroupPromote(byte target) => RequestGroupOp(GroupOp.Promote, w => w.U8(target));
+
+    public void GroupKick(byte target)
+    {
+        var member = MyGroup?.Member(target);
+        if (member != null) GroupKick(member.Key);
+    }
+
+    public void GroupDismissBot(byte owner, int npcId) =>
+        RequestGroupOp(GroupOp.DismissBot, w => { w.U8(owner); w.I32(npcId); });
 
     /// <summary>Send content to the other online members of the local player's group (reliable, through the host).</summary>
     public void GroupCast(byte[] data)
     {
         if (data == null || data.Length > ushort.MaxValue) return;
-        GroupRequest(GroupOp.Cast, w => w.Blob(data));
+        RequestGroupOp(GroupOp.Cast, w => w.Blob(data));
     }
-
-    private int _reportedBots = -1;
 
     /// <summary>The local player's number of bot companions (they count towards the group limit).</summary>
     public void ReportBots(int count)
     {
         if (count == _reportedBots) return;
         _reportedBots = count;
-        GroupRequest(GroupOp.Bots, w => w.U8((byte)Math.Clamp(count, 0, 255)));
+        RequestGroupOp(GroupOp.Bots, w => w.U8((byte)Math.Clamp(count, 0, byte.MaxValue)));
     }
 
     /// <summary>Free member slots for the local player's bots (the game asks before recruiting one).</summary>
@@ -450,421 +413,582 @@ public sealed class CoopSession : IDisposable
     {
         get
         {
-            var g = MyGroup;
-            int mine = Math.Max(0, _reportedBots);
-            return g == null ? GroupRegistry.MaxSize - 1 - mine : GroupRegistry.MaxSize - g.Size;
+            var group = MyGroup;
+            if (group != null) return GroupRegistry.MaxSize - group.Size;
+            int ownBots = Math.Max(0, _reportedBots);
+            return GroupRegistry.MaxSize - 1 - ownBots;
         }
     }
 
-    private void GroupRequest(GroupOp op, Action<NetWriter> body)
+    private void RequestGroupOp(GroupOp op, Action<NetWriter> writeBody)
     {
         if (State != SessionState.Connected) return;
-        if (IsHost) { var w = new NetWriter(); body(w); var r = new NetReader(w.Span.ToArray()); HostGroupOp(LocalId, op, ref r); return; }
-        _w.Reset(); _w.U8((byte)MsgType.Group); _w.U8((byte)op); body(_w);
-        _t.Send(ITransport.ServerConnection, _w.Span, Delivery.Reliable);
+        if (IsHost) HandleOwnGroupOp(op, writeBody);
+        else SendGroupOpToHost(op, writeBody);
     }
 
-    private void HostGroupOp(byte from, GroupOp op, ref NetReader r)
+    private void HandleOwnGroupOp(GroupOp op, Action<NetWriter> writeBody)
+    {
+        var body = new NetWriter();
+        writeBody(body);
+        var reader = new NetReader(body.Span.ToArray());
+        HostGroupOp(LocalId, op, ref reader);
+    }
+
+    private void SendGroupOpToHost(GroupOp op, Action<NetWriter> writeBody)
+    {
+        var writer = _outbox.Begin(MsgType.Group);
+        writer.U8((byte)op);
+        writeBody(writer);
+        _outbox.ToHost(Delivery.Reliable);
+    }
+
+    private void HostGroupOp(byte from, GroupOp op, ref NetReader reader)
     {
         double now = _clock();
         switch (op)
         {
-            case GroupOp.Invite: _groupReg.Invite(from, r.U8(), now); break;
-            case GroupOp.Answer: _groupReg.Answer(from, r.Bool(), now); break;
-            case GroupOp.Leave: _groupReg.Leave(from); break;
-            case GroupOp.Kick: _groupReg.Kick(from, r.Str()); break;
-            case GroupOp.Promote: _groupReg.Promote(from, r.U8()); break;
-            case GroupOp.DismissBot: { byte owner = r.U8(); _groupReg.DismissBot(from, owner, r.I32()); break; }
-            case GroupOp.Bots: _groupReg.SetBots(from, r.U8()); break;
-            case GroupOp.Cast:
-            {
-                var data = r.Blob();
-                var g = _groupReg.GroupOf(from);
-                if (g == null) break;
-                foreach (var m in g.Members)
-                    if (m.Online && m.Id != from)
-                        ToPlayer(m.Id, GroupOp.FromMember, w => { w.U8(from); w.Blob(data); },
-                            () => GroupMessage?.Invoke(from, data));
-                break;
-            }
+            case GroupOp.Invite: _groupRegistry.Invite(from, reader.U8(), now); break;
+            case GroupOp.Answer: _groupRegistry.Answer(from, reader.Bool(), now); break;
+            case GroupOp.Leave: _groupRegistry.Leave(from); break;
+            case GroupOp.Kick: _groupRegistry.Kick(from, reader.Str()); break;
+            case GroupOp.Promote: _groupRegistry.Promote(from, reader.U8()); break;
+            case GroupOp.DismissBot: DismissBot(from, ref reader); break;
+            case GroupOp.Bots: _groupRegistry.SetBots(from, reader.U8()); break;
+            case GroupOp.Cast: RelayGroupCast(from, reader.Blob()); break;
         }
     }
 
-    /// <summary>Host: deliver a group message to one player (or raise it here when it is the host).</summary>
-    private void ToPlayer(byte player, GroupOp op, Action<NetWriter> body, Action local)
+    private void DismissBot(byte leader, ref NetReader reader)
     {
-        if (player == LocalId) { local(); return; }
-        int conn = ConnOf(player);
-        if (conn < 0) return;
-        _w.Reset(); _w.U8((byte)MsgType.Group); _w.U8((byte)op); body(_w);
-        _t.Send(conn, _w.Span, Delivery.Reliable);
+        byte owner = reader.U8();
+        _groupRegistry.DismissBot(leader, owner, reader.I32());
     }
 
-    private void WriteGroupState()
+    private void RelayGroupCast(byte from, byte[] data)
     {
-        _w.Reset(); _w.U8((byte)MsgType.Group); _w.U8((byte)GroupOp.State);
-        var all = _groupReg.All;
-        _w.U8((byte)all.Count);
-        foreach (var g in all)
+        var group = _groupRegistry.GroupOf(from);
+        if (group == null) return;
+        foreach (var member in group.Members)
         {
-            _w.U8(g.Id); _w.Str(g.LeaderKey); _w.U8((byte)g.Members.Count);
-            foreach (var m in g.Members) { _w.Str(m.Key); _w.Str(m.Name); _w.U8(m.Id); _w.U8((byte)Math.Clamp(m.Bots, 0, 255)); }
+            if (!member.Online || member.Id == from) continue;
+            SendGroupMessage(member.Id, GroupOp.FromMember,
+                w => { w.U8(from); w.Blob(data); },
+                () => GroupMessage?.Invoke(from, data));
         }
+    }
+
+    /// <summary>Host: deliver a group message to one player, or run <paramref name="deliverLocally"/> when it is the host.</summary>
+    private void SendGroupMessage(byte player, GroupOp op, Action<NetWriter> writeBody, Action deliverLocally)
+    {
+        if (player == LocalId)
+        {
+            deliverLocally();
+            return;
+        }
+        int connection = _peers.ConnectionOf(player);
+        if (connection < 0) return;
+        var writer = _outbox.Begin(MsgType.Group);
+        writer.U8((byte)op);
+        writeBody(writer);
+        _outbox.To(connection, Delivery.Reliable);
+    }
+
+    private void ListenToGroupRegistry()
+    {
+        _groupRegistry.Changed += OnGroupsDecided;
+        _groupRegistry.Notice += (player, text) =>
+            SendGroupMessage(player, GroupOp.Notice, w => w.Str(text), () => GroupNotice?.Invoke(text));
+        _groupRegistry.InviteSent += (to, from) =>
+            SendGroupMessage(to, GroupOp.InvitedBy, w => w.U8(from), () => GroupInvited?.Invoke(from));
+        _groupRegistry.BotDismissed += (owner, npcId) =>
+            SendGroupMessage(owner, GroupOp.BotDismissed, w => w.I32(npcId), () => GroupBotDismissed?.Invoke(npcId));
+        _groupRegistry.Rejoined += SendReturnPlace;
+    }
+
+    private void SendReturnPlace(byte player)
+    {
+        if (!Players.TryGetValue(player, out var info)) return;
+        if (!_placeByPlayerKey.TryGetValue(_playerKeys.Of(info), out var place)) return;
+        SendGroupMessage(player, GroupOp.ReturnTo, w => WritePlace(w, place), () => { });
+    }
+
+    private static void WritePlace(NetWriter writer, Place place)
+    {
+        writer.I32(place.Scene);
+        writer.F32(place.X);
+        writer.F32(place.Y);
+        writer.F32(place.Z);
     }
 
     private void OnGroupsDecided()
     {
         WriteGroupState();
-        Broadcast(_w.Span, Delivery.Reliable, exceptConn: -1);
-        var r = new NetReader(_w.Span.ToArray());
-        r.U8(); r.U8();
-        ReadGroupState(ref r);
-    }
-
-    private void ReadGroupState(ref NetReader r)
-    {
-        _groups.Clear();
-        int n = r.U8();
-        for (int i = 0; i < n; i++)
-        {
-            var g = new GroupInfo { Id = r.U8(), LeaderKey = r.Str() };
-            int m = r.U8();
-            for (int k = 0; k < m; k++) g.Members.Add(new GroupMemberInfo { Key = r.Str(), Name = r.Str(), Id = r.U8(), Bots = r.U8() });
-            _groups.Add(g);
-        }
+        _outbox.ToEveryone(Delivery.Reliable);
+        var reader = new NetReader(_outbox.Pending.ToArray());
+        reader.U8();
+        reader.U8();
+        _groups.ReplaceFrom(ref reader);
         GroupsChanged?.Invoke();
     }
 
-    private void ClientGroupOp(GroupOp op, ref NetReader r)
+    private void WriteGroupState()
     {
-        switch (op)
+        var writer = _outbox.Begin(MsgType.Group);
+        writer.U8((byte)GroupOp.State);
+        var groups = _groupRegistry.All;
+        writer.U8((byte)groups.Count);
+        foreach (var group in groups) WriteGroup(writer, group);
+    }
+
+    private static void WriteGroup(NetWriter writer, GroupRegistry.Group group)
+    {
+        writer.U8(group.Id);
+        writer.Str(group.LeaderKey);
+        writer.U8((byte)group.Members.Count);
+        foreach (var member in group.Members)
         {
-            case GroupOp.State: ReadGroupState(ref r); break;
-            case GroupOp.InvitedBy: GroupInvited?.Invoke(r.U8()); break;
-            case GroupOp.Notice: GroupNotice?.Invoke(r.Str()); break;
-            case GroupOp.BotDismissed: GroupBotDismissed?.Invoke(r.I32()); break;
-            case GroupOp.ReturnTo: { int scene = r.I32(); float x = r.F32(), y = r.F32(), z = r.F32(); ReturnRequested?.Invoke(scene, x, y, z); break; }
-            case GroupOp.FromMember: { byte from = r.U8(); GroupMessage?.Invoke(from, r.Blob()); break; }
+            writer.Str(member.Key);
+            writer.Str(member.Name);
+            writer.U8(member.Id);
+            writer.U8((byte)Math.Clamp(member.Bots, 0, byte.MaxValue));
         }
     }
 
-    private void Broadcast(ReadOnlySpan<byte> data, Delivery d, int exceptConn)
+    private void OnClientGroupOp(MsgType type, ref NetReader reader)
     {
-        foreach (var conn in _connToPlayer.Keys)
-            if (conn != exceptConn) _t.Send(conn, data, d);
+        switch ((GroupOp)reader.U8())
+        {
+            case GroupOp.State: _groups.ReplaceFrom(ref reader); GroupsChanged?.Invoke(); break;
+            case GroupOp.InvitedBy: GroupInvited?.Invoke(reader.U8()); break;
+            case GroupOp.Notice: GroupNotice?.Invoke(reader.Str()); break;
+            case GroupOp.BotDismissed: GroupBotDismissed?.Invoke(reader.I32()); break;
+            case GroupOp.ReturnTo: RaiseReturnRequested(ref reader); break;
+            case GroupOp.FromMember: RaiseGroupMessage(ref reader); break;
+        }
     }
 
-    // ---------------- transport events ----------------
-
-    private void OnConnected(int conn)
+    private void RaiseReturnRequested(ref NetReader reader)
     {
-        if (IsHost)
-        {
-            _awaitingHello[conn] = _clock();
-            return;
-        }
+        int scene = reader.I32();
+        float x = reader.F32(), y = reader.F32(), z = reader.F32();
+        ReturnRequested?.Invoke(scene, x, y, z);
+    }
+
+    private void RaiseGroupMessage(ref NetReader reader)
+    {
+        byte from = reader.U8();
+        GroupMessage?.Invoke(from, reader.Blob());
+    }
+
+    private void OnConnected(int connection)
+    {
+        if (IsHost) _peers.AwaitHello(connection, _clock());
+        else SendHello(connection);
+    }
+
+    private void SendHello(int connection)
+    {
         State = SessionState.Handshaking;
         Status = "Handshaking...";
-        _w.Reset();
         new HelloMsg
         {
-            Protocol = ProtocolInfo.Version, ModVersion = _cfg.ModVersion, GameBuild = _cfg.GameBuild,
-            PlayerName = _cfg.PlayerName, SteamId = _cfg.SteamId, ClientId = _cfg.ClientId, Password = _cfg.Password ?? "",
-        }.Write(_w);
-        _t.Send(conn, _w.Span, Delivery.Reliable);
+            Protocol = ProtocolInfo.Version,
+            ModVersion = _config.ModVersion,
+            GameBuild = _config.GameBuild,
+            PlayerName = _config.PlayerName,
+            SteamId = _config.SteamId,
+            ClientId = _config.ClientId,
+            Password = _config.Password ?? "",
+        }.Write(_outbox.BeginUntyped());
+        _outbox.To(connection, Delivery.Reliable);
     }
 
-    private void OnDisconnected(int conn, string reason)
+    private void OnDisconnected(int connection, string reason)
     {
-        if (IsHost)
+        if (!IsHost)
         {
-            _awaitingHello.Remove(conn);
-            if (!_connToPlayer.Remove(conn, out var id)) return;
-            if (Players.Remove(id, out var info))
-            {
-                _menuOpen.Remove(id);
-                _leases.PlayerLeft(id, _clock());
-                if (_lastPlace.Remove(id, out var place)) _placeByKey[KeyOf(info)] = place;
-                _groupReg.PlayerOffline(id); // their place in a group waits for them
-                _playerKey.Remove(id);
-                _w.Reset(); _w.U8((byte)MsgType.PlayerLeft); _w.U8(id);
-                Broadcast(_w.Span, Delivery.Reliable, exceptConn: -1);
-                Log?.Invoke($"{info.Name} left ({reason})");
-                PlayerLeft?.Invoke(info);
-                RecomputePause();
-            }
+            Close($"Disconnected: {reason}");
             return;
         }
-        Close($"Disconnected: {reason}");
+        _peers.StopAwaitingHello(connection);
+        if (_peers.Remove(connection, out var player)) RemovePlayer(player, reason);
     }
 
-    private void OnReceived(int conn, ReadOnlyMemory<byte> mem)
+    private void RemovePlayer(byte id, string reason)
+    {
+        if (!Players.Remove(id, out var info)) return;
+        _pause.Forget(id);
+        _leases.PlayerLeft(id, _clock());
+        if (_lastPlaceByPlayer.Remove(id, out var place)) _placeByPlayerKey[_playerKeys.Of(info)] = place;
+        _groupRegistry.PlayerOffline(id);
+        _playerKeys.Release(id);
+        _outbox.Begin(MsgType.PlayerLeft).U8(id);
+        _outbox.ToEveryone(Delivery.Reliable);
+        Log?.Invoke($"{info.Name} left ({reason})");
+        PlayerLeft?.Invoke(info);
+        RecomputePause();
+    }
+
+    private void OnReceived(int connection, ReadOnlyMemory<byte> data)
     {
         try
         {
-            var r = new NetReader(mem.Span);
-            var type = (MsgType)r.U8();
-            if (IsHost) HostHandle(conn, type, ref r, mem.Span);
-            else ClientHandle(type, ref r);
+            var reader = new NetReader(data.Span);
+            var type = (MsgType)reader.U8();
+            if (IsHost) HandleAsHost(connection, type, ref reader);
+            else HandleAsClient(type, ref reader);
         }
         catch (ProtocolException e)
         {
-            Log?.Invoke($"Bad packet from {conn}: {e.Message}");
-            if (IsHost) _t.Disconnect(conn, "protocol error");
+            Log?.Invoke($"Bad packet from {connection}: {e.Message}");
+            if (IsHost) _transport.Disconnect(connection, "protocol error");
         }
         catch (Exception e)
         {
             // a bug in one handler: that message is lost, the rest of the batch and the connection are not
-            Log?.Invoke($"Handling a message from {conn} failed: {e}");
+            Log?.Invoke($"Handling a message from {connection} failed: {e}");
         }
     }
 
-    // ---------------- host ----------------
+    private Dictionary<MsgType, HostHandler> CreateHostHandlers() => new()
+    {
+        [MsgType.PlayerInfo] = OnPlayerInfoFromPeer,
+        [MsgType.PlayerState] = OnPlayerStateFromPeer,
+        [MsgType.MenuState] = OnMenuStateFromPeer,
+        [MsgType.Fx] = RelayPayloadFromPeer,
+        [MsgType.FxStream] = RelayPayloadFromPeer,
+        [MsgType.World] = RelayPayloadFromPeer,
+        [MsgType.WorldStream] = RelayPayloadFromPeer,
+        [MsgType.WorldStreamTo] = RelayWorldStreamToOnePlayer,
+        [MsgType.Interest] = OnInterestFromPeer,
+        [MsgType.LeaseCombat] = OnLeaseCombatFromPeer,
+        [MsgType.Group] = OnGroupOpFromPeer,
+        [MsgType.Chat] = OnChatFromPeer,
+    };
 
-    private void HostHandle(int conn, MsgType type, ref NetReader r, ReadOnlySpan<byte> raw)
+    private void HandleAsHost(int connection, MsgType type, ref NetReader reader)
     {
         if (type == MsgType.Hello)
         {
-            var hello = HelloMsg.Read(ref r);
-            HostAccept(conn, hello);
+            HostAccept(connection, HelloMsg.Read(ref reader));
             return;
         }
-        if (!_connToPlayer.TryGetValue(conn, out byte id)) return; // ignore anything before a successful Hello
-
-        switch (type)
-        {
-            case MsgType.PlayerInfo:
-            {
-                var info = PlayerInfo.Read(ref r);
-                info.Id = id;
-                var existing = Players[id];
-                info.Name = existing.Name; info.SteamId = existing.SteamId; info.Key = existing.Key; // identity is fixed at handshake
-                Players[id] = info;
-                _groupReg.SetName(id, info.CharacterName);
-                _w.Reset(); _w.U8((byte)MsgType.PlayerInfo); info.Write(_w);
-                Broadcast(_w.Span, Delivery.Reliable, exceptConn: conn);
-                PlayerInfoChanged?.Invoke(info);
-                break;
-            }
-            case MsgType.PlayerState:
-            {
-                var m = PlayerStateMsg.Read(ref r);
-                m.Id = id;
-                if (m.InWorld) _lastPlace[id] = (m.SceneHash, m.PosX, m.PosY, m.PosZ);
-                _w.Reset(); m.Write(_w);
-                Broadcast(_w.Span, Delivery.Unreliable, exceptConn: conn);
-                StateReceived?.Invoke(m);
-                break;
-            }
-            case MsgType.MenuState:
-                _menuOpen[id] = r.Bool();
-                RecomputePause();
-                break;
-            case MsgType.Fx:
-            case MsgType.FxStream:
-            case MsgType.World:
-            case MsgType.WorldStream:
-            {
-                r.U8();
-                var blob = r.Blob();
-                _w.Reset(); _w.U8((byte)type); _w.U8(id); _w.Blob(blob);
-                bool reliable = type is MsgType.Fx or MsgType.World;
-                Broadcast(_w.Span, reliable ? Delivery.Reliable : Delivery.UnreliableUnordered, exceptConn: conn);
-                if (type is MsgType.Fx or MsgType.FxStream) FxReceived?.Invoke(id, blob);
-                else WorldReceived?.Invoke(id, blob);
-                break;
-            }
-            case MsgType.WorldStreamTo:
-            {
-                r.U8();
-                byte to = r.U8();
-                var blob = r.Blob();
-                if (to == LocalId) { WorldReceived?.Invoke(id, blob); break; }
-                int target = ConnOf(to);
-                if (target < 0 || target == conn) break;
-                _w.Reset(); _w.U8((byte)MsgType.WorldStream); _w.U8(id); _w.Blob(blob); // the sender as the host knows it
-                _t.Send(target, _w.Span, Delivery.UnreliableUnordered);
-                break;
-            }
-            case MsgType.Interest:
-            {
-                uint key = r.U32();
-                bool near = r.Bool();
-                bool leftPlace = r.Remaining > 0 && r.Bool();
-                if (near) _leases.Subscribe(id, LeaseKey(key), _clock());
-                else _leases.Unsubscribe(id, LeaseKey(key), _clock(), leftPlace);
-                break;
-            }
-            case MsgType.LeaseCombat:
-            {
-                uint key = r.U32();
-                _leases.SetCombat(id, LeaseKey(key), r.Bool(), _clock());
-                break;
-            }
-            case MsgType.Group:
-                HostGroupOp(id, (GroupOp)r.U8(), ref r);
-                break;
-            case MsgType.Chat:
-            {
-                r.U8();
-                var text = r.Str();
-                if (text.Length > 300) text = text.Substring(0, 300);
-                _w.Reset(); _w.U8((byte)MsgType.Chat); _w.U8(id); _w.Str(text);
-                Broadcast(_w.Span, Delivery.Reliable, exceptConn: conn);
-                ChatReceived?.Invoke(id, text);
-                break;
-            }
-        }
+        if (!_peers.TryGetPlayer(connection, out byte sender)) return;
+        if (_hostHandlers.TryGetValue(type, out var handle)) handle(type, connection, sender, ref reader);
     }
 
-    private void HostAccept(int conn, HelloMsg hello)
+    private void OnPlayerInfoFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
     {
-        _awaitingHello.Remove(conn);
-        string reject = null;
-        if (hello.Protocol != ProtocolInfo.Version)
-            reject = $"Mod protocol mismatch (host {ProtocolInfo.Version}, you {hello.Protocol}). Update the mod.";
-        else if (!string.IsNullOrEmpty(_cfg.GameBuild) && !string.IsNullOrEmpty(hello.GameBuild) && hello.GameBuild != _cfg.GameBuild)
-            reject = "Different game version than the host. Both players must update Afallon.";
-        else if (!string.IsNullOrEmpty(_cfg.Password) && hello.Password != _cfg.Password)
-            reject = string.IsNullOrEmpty(hello.Password) ? "This game has a password: enter it under CO-OP > JOIN GAME." : "Wrong password.";
-        else if (IsBanned?.Invoke(hello.SteamId, hello.ClientId) == true)
-            reject = "The host has banned you from this game.";
-        else if (_connToPlayer.ContainsKey(conn))
-            reject = "Already connected.";
-        else if (Players.Count >= ProtocolInfo.MaxPlayers)
-            reject = $"Session is full ({ProtocolInfo.MaxPlayers} players).";
+        var info = PlayerInfo.Read(ref reader);
+        var existing = Players[sender];
+        info.Id = sender;
+        info.Name = existing.Name;
+        info.SteamId = existing.SteamId;
+        info.Key = existing.Key;
+        Players[sender] = info;
+        _groupRegistry.SetName(sender, info.CharacterName);
+        info.Write(_outbox.Begin(MsgType.PlayerInfo));
+        _outbox.ToEveryone(Delivery.Reliable, exceptConnection: connection);
+        PlayerInfoChanged?.Invoke(info);
+    }
 
-        if (reject != null)
+    private void OnPlayerStateFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
+    {
+        var state = PlayerStateMsg.Read(ref reader);
+        state.Id = sender;
+        if (state.InWorld) _lastPlaceByPlayer[sender] = new Place(state.SceneHash, state.PosX, state.PosY, state.PosZ);
+        state.Write(_outbox.BeginUntyped());
+        _outbox.ToEveryone(Delivery.Unreliable, exceptConnection: connection);
+        StateReceived?.Invoke(state);
+    }
+
+    private void OnMenuStateFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
+    {
+        _pause.SetMenuOpen(sender, reader.Bool());
+        RecomputePause();
+    }
+
+    private void RelayPayloadFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
+    {
+        reader.U8();
+        var payload = reader.Blob();
+        var writer = _outbox.Begin(type);
+        writer.U8(sender);
+        writer.Blob(payload);
+        _outbox.ToEveryone(DeliveryOf(type), exceptConnection: connection);
+        RaisePayloadReceived(type, sender, payload);
+    }
+
+    private void RelayWorldStreamToOnePlayer(MsgType type, int connection, byte sender, ref NetReader reader)
+    {
+        reader.U8();
+        byte target = reader.U8();
+        var payload = reader.Blob();
+        if (target == LocalId)
         {
-            _w.Reset(); _w.U8((byte)MsgType.Reject); _w.Str(reject);
-            _t.Send(conn, _w.Span, Delivery.Reliable);
-            _t.Disconnect(conn, reject);
-            Log?.Invoke($"Rejected {hello.PlayerName}: {reject}");
+            WorldReceived?.Invoke(sender, payload);
             return;
         }
+        int targetConnection = _peers.ConnectionOf(target);
+        if (targetConnection < 0 || targetConnection == connection) return;
+        var writer = _outbox.Begin(MsgType.WorldStream);
+        writer.U8(sender);
+        writer.Blob(payload);
+        _outbox.To(targetConnection, Delivery.UnreliableUnordered);
+    }
 
-        byte id = 1;
-        while (Players.ContainsKey(id)) id++;
-        var info = new PlayerInfo { Id = id, Name = string.IsNullOrWhiteSpace(hello.PlayerName) ? $"Player {id}" : hello.PlayerName, SteamId = hello.SteamId, Key = LastingKey(id, hello.SteamId, hello.ClientId) };
-        Players[id] = info;
-        _connToPlayer[conn] = id;
+    private void OnInterestFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
+    {
+        string key = FormatLeaseKey(reader.U32());
+        bool near = reader.Bool();
+        bool leftPlace = reader.Remaining > 0 && reader.Bool();
+        if (near) _leases.Subscribe(sender, key, _clock());
+        else _leases.Unsubscribe(sender, key, _clock(), leftPlace);
+    }
 
-        _w.Reset(); _w.U8((byte)MsgType.Welcome); _w.U8(id); _w.U8((byte)Players.Count);
-        foreach (var p in Players.Values) p.Write(_w);
-        _t.Send(conn, _w.Span, Delivery.Reliable);
+    private void OnLeaseCombatFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
+    {
+        string key = FormatLeaseKey(reader.U32());
+        _leases.SetCombat(sender, key, reader.Bool(), _clock());
+    }
 
-        _w.Reset(); _w.U8((byte)MsgType.PlayerJoined); info.Write(_w);
-        Broadcast(_w.Span, Delivery.Reliable, exceptConn: conn);
+    private void OnGroupOpFromPeer(MsgType type, int connection, byte sender, ref NetReader reader) =>
+        HostGroupOp(sender, (GroupOp)reader.U8(), ref reader);
 
-        Log?.Invoke($"{info.Name} joined as #{id}");
-        PlayerJoined?.Invoke(info);
+    private void OnChatFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
+    {
+        reader.U8();
+        string text = reader.Str();
+        if (text.Length > MaxChatLength) text = text.Substring(0, MaxChatLength);
+        var writer = _outbox.Begin(MsgType.Chat);
+        writer.U8(sender);
+        writer.Str(text);
+        _outbox.ToEveryone(Delivery.Reliable, exceptConnection: connection);
+        ChatReceived?.Invoke(sender, text);
+    }
 
-        foreach (var kv in _leaseView)
+    private static Delivery DeliveryOf(MsgType type) =>
+        type is MsgType.Fx or MsgType.World ? Delivery.Reliable : Delivery.UnreliableUnordered;
+
+    private void RaisePayloadReceived(MsgType type, byte sender, byte[] payload)
+    {
+        if (type is MsgType.Fx or MsgType.FxStream) FxReceived?.Invoke(sender, payload);
+        else WorldReceived?.Invoke(sender, payload);
+    }
+
+    private void HostAccept(int connection, HelloMsg hello)
+    {
+        _peers.StopAwaitingHello(connection);
+        string rejection = RejectionReason(connection, hello);
+        if (rejection != null)
         {
-            WriteLeaseOwner(kv.Key, kv.Value.owner, kv.Value.epoch);
-            _t.Send(conn, _w.Span, Delivery.Reliable);
+            Reject(connection, hello, rejection);
+            return;
         }
-
-        WriteGroupState();
-        _t.Send(conn, _w.Span, Delivery.Reliable);
-        _groupReg.PlayerOnline(id, MakeKey(id, hello.SteamId, hello.ClientId), info.Name); // back in their group if they had one
-
-        _menuOpen[id] = true; // still in the main menu until they report otherwise
+        var info = AdmitPlayer(connection, hello);
+        SendWelcome(connection, info.Id);
+        AnnounceJoined(connection, info);
+        SendCurrentWorldState(connection);
+        _groupRegistry.PlayerOnline(info.Id, _playerKeys.Assign(info.Id, hello.SteamId, hello.ClientId), info.Name);
+        _pause.SetMenuOpen(info.Id, open: true);
         RecomputePause();
         WritePauseState();
-        _t.Send(conn, _w.Span, Delivery.Reliable);
+        _outbox.To(connection, Delivery.Reliable);
     }
 
-    // ---------------- client ----------------
-
-    private void ClientHandle(MsgType type, ref NetReader r)
+    private string RejectionReason(int connection, HelloMsg hello)
     {
-        switch (type)
+        if (hello.Protocol != ProtocolInfo.Version)
+            return $"Mod protocol mismatch (host {ProtocolInfo.Version}, you {hello.Protocol}). Update the mod.";
+        if (IsGameBuildMismatch(hello))
+            return "Different game version than the host. Both players must update Afallon.";
+        if (IsPasswordWrong(hello))
+            return string.IsNullOrEmpty(hello.Password) ? "This game has a password: enter it under CO-OP > JOIN GAME." : "Wrong password.";
+        if (IsBanned?.Invoke(hello.SteamId, hello.ClientId) == true)
+            return "The host has banned you from this game.";
+        if (_peers.Has(connection))
+            return "Already connected.";
+        if (Players.Count >= ProtocolInfo.MaxPlayers)
+            return $"Session is full ({ProtocolInfo.MaxPlayers} players).";
+        return null;
+    }
+
+    private bool IsGameBuildMismatch(HelloMsg hello) =>
+        !string.IsNullOrEmpty(_config.GameBuild)
+        && !string.IsNullOrEmpty(hello.GameBuild)
+        && hello.GameBuild != _config.GameBuild;
+
+    private bool IsPasswordWrong(HelloMsg hello) =>
+        !string.IsNullOrEmpty(_config.Password) && hello.Password != _config.Password;
+
+    private void Reject(int connection, HelloMsg hello, string reason)
+    {
+        _outbox.Begin(MsgType.Reject).Str(reason);
+        _outbox.To(connection, Delivery.Reliable);
+        _transport.Disconnect(connection, reason);
+        Log?.Invoke($"Rejected {hello.PlayerName}: {reason}");
+    }
+
+    private PlayerInfo AdmitPlayer(int connection, HelloMsg hello)
+    {
+        byte id = FirstFreePlayerId();
+        var info = new PlayerInfo
         {
-            case MsgType.Welcome:
-            {
-                LocalId = r.U8();
-                int n = r.U8();
-                Players.Clear();
-                for (int i = 0; i < n; i++) { var p = PlayerInfo.Read(ref r); Players[p.Id] = p; }
-                State = SessionState.Connected;
-                Status = "Connected via " + _t.Description;
-                Log?.Invoke($"Joined as #{LocalId}, {Players.Count} players");
-                foreach (var p in Players.Values.Where(p => p.Id != LocalId)) PlayerJoined?.Invoke(p);
-                _w.Reset(); _w.U8((byte)MsgType.MenuState); _w.Bool(_localMenuOpen);
-                _t.Send(ITransport.ServerConnection, _w.Span, Delivery.Reliable);
-                foreach (var key in _interest) SendInterest(key, true); // reported before the handshake finished
-                if (_reportedBots > 0) { int b = _reportedBots; _reportedBots = -1; ReportBots(b); }
-                break;
-            }
-            case MsgType.Fx:
-            case MsgType.FxStream:
-            case MsgType.World:
-            case MsgType.WorldStream:
-            {
-                byte id = r.U8();
-                var blob = r.Blob();
-                if (id == LocalId || !Players.ContainsKey(id)) break; // late from a player who left
-                if (type is MsgType.Fx or MsgType.FxStream) FxReceived?.Invoke(id, blob);
-                else WorldReceived?.Invoke(id, blob);
-                break;
-            }
-            case MsgType.LeaseOwner:
-            {
-                uint key = r.U32();
-                byte owner = r.U8();
-                ApplyLeaseOwner(key, owner, r.U32());
-                break;
-            }
-            case MsgType.Group:
-                ClientGroupOp((GroupOp)r.U8(), ref r);
-                break;
-            case MsgType.PauseState:
-            {
-                bool paused = r.Bool();
-                var reason = (PauseReason)r.U8();
-                ApplyPause(paused, reason);
-                break;
-            }
-            case MsgType.Reject:
-                Status = r.Str();
-                Close(Status);
-                break;
-            case MsgType.PlayerJoined:
-            {
-                var p = PlayerInfo.Read(ref r);
-                Players[p.Id] = p;
-                PlayerJoined?.Invoke(p);
-                break;
-            }
-            case MsgType.PlayerLeft:
-            {
-                byte id = r.U8();
-                if (Players.Remove(id, out var p)) PlayerLeft?.Invoke(p);
-                break;
-            }
-            case MsgType.PlayerInfo:
-            {
-                var p = PlayerInfo.Read(ref r);
-                if (p.Id == LocalId) break;
-                Players[p.Id] = p;
-                PlayerInfoChanged?.Invoke(p);
-                break;
-            }
-            case MsgType.PlayerState:
-            {
-                var m = PlayerStateMsg.Read(ref r);
-                // unreliable, so it can come after PlayerLeft: it would bring back a puppet whose sequence hides the next one with that id
-                if (m.Id != LocalId && Players.ContainsKey(m.Id)) StateReceived?.Invoke(m);
-                break;
-            }
-            case MsgType.Chat:
-            {
-                byte id = r.U8();
-                ChatReceived?.Invoke(id, r.Str());
-                break;
-            }
+            Id = id,
+            Name = string.IsNullOrWhiteSpace(hello.PlayerName) ? $"Player {id}" : hello.PlayerName,
+            SteamId = hello.SteamId,
+            Key = _playerKeys.Lasting(id, hello.SteamId, hello.ClientId, Players.Values),
+        };
+        Players[id] = info;
+        _peers.Admit(connection, id);
+        return info;
+    }
+
+    private byte FirstFreePlayerId()
+    {
+        byte id = 1;
+        while (Players.ContainsKey(id)) id++;
+        return id;
+    }
+
+    private void SendWelcome(int connection, byte assignedId)
+    {
+        var writer = _outbox.Begin(MsgType.Welcome);
+        writer.U8(assignedId);
+        writer.U8((byte)Players.Count);
+        foreach (var player in Players.Values) player.Write(writer);
+        _outbox.To(connection, Delivery.Reliable);
+    }
+
+    private void AnnounceJoined(int connection, PlayerInfo info)
+    {
+        info.Write(_outbox.Begin(MsgType.PlayerJoined));
+        _outbox.ToEveryone(Delivery.Reliable, exceptConnection: connection);
+        Log?.Invoke($"{info.Name} joined as #{info.Id}");
+        PlayerJoined?.Invoke(info);
+    }
+
+    private void SendCurrentWorldState(int connection)
+    {
+        foreach (var entry in _leaseView.Entries)
+        {
+            WriteLeaseOwner(entry.Key, entry.Value.owner, entry.Value.epoch);
+            _outbox.To(connection, Delivery.Reliable);
         }
+        WriteGroupState();
+        _outbox.To(connection, Delivery.Reliable);
+    }
+
+    private Dictionary<MsgType, ClientHandler> CreateClientHandlers() => new()
+    {
+        [MsgType.Welcome] = OnWelcome,
+        [MsgType.Fx] = OnRelayedPayload,
+        [MsgType.FxStream] = OnRelayedPayload,
+        [MsgType.World] = OnRelayedPayload,
+        [MsgType.WorldStream] = OnRelayedPayload,
+        [MsgType.LeaseOwner] = OnLeaseOwner,
+        [MsgType.Group] = OnClientGroupOp,
+        [MsgType.PauseState] = OnPauseState,
+        [MsgType.Reject] = OnReject,
+        [MsgType.PlayerJoined] = OnPlayerJoined,
+        [MsgType.PlayerLeft] = OnPlayerLeft,
+        [MsgType.PlayerInfo] = OnPlayerInfo,
+        [MsgType.PlayerState] = OnPlayerState,
+        [MsgType.Chat] = OnChat,
+    };
+
+    private void HandleAsClient(MsgType type, ref NetReader reader)
+    {
+        if (_clientHandlers.TryGetValue(type, out var handle)) handle(type, ref reader);
+    }
+
+    private void OnWelcome(MsgType type, ref NetReader reader)
+    {
+        LocalId = reader.U8();
+        int count = reader.U8();
+        Players.Clear();
+        for (int i = 0; i < count; i++)
+        {
+            var player = PlayerInfo.Read(ref reader);
+            Players[player.Id] = player;
+        }
+        State = SessionState.Connected;
+        Status = "Connected via " + _transport.Description;
+        Log?.Invoke($"Joined as #{LocalId}, {Players.Count} players");
+        foreach (var player in Players.Values.Where(p => p.Id != LocalId)) PlayerJoined?.Invoke(player);
+        ReportStateKnownBeforeWelcome();
+    }
+
+    private void ReportStateKnownBeforeWelcome()
+    {
+        SendMenuStateToHost(_localMenuOpen);
+        foreach (var key in _interest) SendInterest(key, near: true);
+        if (_reportedBots <= 0) return;
+        int bots = _reportedBots;
+        _reportedBots = BotCountUnknown;
+        ReportBots(bots);
+    }
+
+    private void OnRelayedPayload(MsgType type, ref NetReader reader)
+    {
+        byte sender = reader.U8();
+        var payload = reader.Blob();
+        bool isKnownRemotePlayer = sender != LocalId && Players.ContainsKey(sender);
+        if (isKnownRemotePlayer) RaisePayloadReceived(type, sender, payload);
+    }
+
+    private void OnLeaseOwner(MsgType type, ref NetReader reader)
+    {
+        uint key = reader.U32();
+        byte owner = reader.U8();
+        ApplyLeaseOwner(key, owner, reader.U32());
+    }
+
+    private void OnPauseState(MsgType type, ref NetReader reader)
+    {
+        bool paused = reader.Bool();
+        ApplyPause(paused, (PauseReason)reader.U8());
+    }
+
+    private void OnReject(MsgType type, ref NetReader reader)
+    {
+        Status = reader.Str();
+        Close(Status);
+    }
+
+    private void OnPlayerJoined(MsgType type, ref NetReader reader)
+    {
+        var player = PlayerInfo.Read(ref reader);
+        Players[player.Id] = player;
+        PlayerJoined?.Invoke(player);
+    }
+
+    private void OnPlayerLeft(MsgType type, ref NetReader reader)
+    {
+        byte id = reader.U8();
+        if (Players.Remove(id, out var player)) PlayerLeft?.Invoke(player);
+    }
+
+    private void OnPlayerInfo(MsgType type, ref NetReader reader)
+    {
+        var player = PlayerInfo.Read(ref reader);
+        if (player.Id == LocalId) return;
+        Players[player.Id] = player;
+        PlayerInfoChanged?.Invoke(player);
+    }
+
+    /// <summary>Unreliable, so it can come after PlayerLeft: it would bring back a puppet whose sequence hides the next one with that id.</summary>
+    private void OnPlayerState(MsgType type, ref NetReader reader)
+    {
+        var state = PlayerStateMsg.Read(ref reader);
+        if (state.Id != LocalId && Players.ContainsKey(state.Id)) StateReceived?.Invoke(state);
+    }
+
+    private void OnChat(MsgType type, ref NetReader reader)
+    {
+        byte sender = reader.U8();
+        ChatReceived?.Invoke(sender, reader.Str());
     }
 
     private void Close(string reason)
@@ -878,16 +1002,20 @@ public sealed class CoopSession : IDisposable
 
     public void Dispose()
     {
-        if (State != SessionState.Closed)
-        {
-            if (IsHost) foreach (var c in _connToPlayer.Keys.ToList()) _t.Disconnect(c, "Host left the session");
-            else _t.Disconnect(ITransport.ServerConnection, "left");
-            _t.Poll();
-        }
+        if (State != SessionState.Closed) DisconnectEveryone();
         Close("Left the session");
-        _t.Connected -= OnConnected;
-        _t.Disconnected -= OnDisconnected;
-        _t.Received -= OnReceived;
-        _t.Dispose();
+        _transport.Connected -= OnConnected;
+        _transport.Disconnected -= OnDisconnected;
+        _transport.Received -= OnReceived;
+        _transport.Dispose();
+    }
+
+    private void DisconnectEveryone()
+    {
+        if (IsHost)
+            foreach (var connection in _peers.Connections.ToList()) _transport.Disconnect(connection, "Host left the session");
+        else
+            _transport.Disconnect(ITransport.ServerConnection, "left");
+        _transport.Poll();
     }
 }

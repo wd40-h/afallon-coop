@@ -13,7 +13,7 @@ public sealed class LeaseRegistry
 {
     public const byte NoOwner = 255;
 
-    public double MigrateToHostAfter = 3.0;   // seconds the spawner must be calm with the host nearby
+    public double MigrateToHostAfter = 3.0;
     public byte HostId = 0;
 
     public sealed class Lease
@@ -24,86 +24,105 @@ public sealed class LeaseRegistry
         public readonly HashSet<byte> Subscribers = new();
         public bool InCombat;
         public double CalmSince;
-        public override string ToString() => $"{Key}: owner={Owner} epoch={Epoch} subs=[{string.Join(",", Subscribers)}] combat={InCombat}";
+
+        public override string ToString() =>
+            $"{Key}: owner={Owner} epoch={Epoch} subs=[{string.Join(",", Subscribers)}] combat={InCombat}";
     }
 
     private readonly Dictionary<string, Lease> _leases = new();
 
-    /// <summary>(key, newOwner or NoOwner, epoch, reason).</summary>
+    /// <summary>The lease whose owner changed (NoOwner = dormant) and why.</summary>
     public event Action<Lease, string> OwnerChanged;
 
     public IReadOnlyDictionary<string, Lease> All => _leases;
-    public Lease Get(string key) => _leases.TryGetValue(key, out var l) ? l : null;
-    public byte OwnerOf(string key) => _leases.TryGetValue(key, out var l) ? l.Owner : NoOwner;
+
+    public Lease Get(string key) => _leases.TryGetValue(key, out var lease) ? lease : null;
+
+    public byte OwnerOf(string key) => Get(key)?.Owner ?? NoOwner;
 
     public void Subscribe(byte player, string key, double now)
     {
-        if (!_leases.TryGetValue(key, out var l)) _leases[key] = l = new Lease { Key = key, CalmSince = now };
-        l.Subscribers.Add(player);
-        if (l.Owner == NoOwner) SetOwner(l, player, now, "first nearby");
+        var lease = GetOrCreate(key, now);
+        lease.Subscribers.Add(player);
+        if (lease.Owner == NoOwner) SetOwner(lease, player, now, "first nearby");
     }
 
     /// <param name="leftPlace">The owner left the scene (or dungeon instance): its mobs are gone there, so even a fight
     /// moves to someone still nearby (who takes the mobs over), as on a disconnect.</param>
     public void Unsubscribe(byte player, string key, double now, bool leftPlace = false)
     {
-        if (!_leases.TryGetValue(key, out var l)) return;
-        l.Subscribers.Remove(player);
-        if (l.Owner != player) return;
-        if (l.InCombat && !leftPlace) return; // the fight follows the owner; decided again when it ends (Tick)
-        l.InCombat = false;
-        Reassign(l, now, leftPlace ? "owner left the area" : "owner left");
+        var lease = Get(key);
+        if (lease == null) return;
+        lease.Subscribers.Remove(player);
+        if (lease.Owner != player) return;
+        bool fightFollowsOwner = lease.InCombat && !leftPlace;
+        if (fightFollowsOwner) return;
+        lease.InCombat = false;
+        Reassign(lease, now, leftPlace ? "owner left the area" : "owner left");
     }
 
     /// <summary>Owner reports whether anything from this spawner is fighting.</summary>
     public void SetCombat(byte player, string key, bool inCombat, double now)
     {
-        if (!_leases.TryGetValue(key, out var l) || l.Owner != player) return;
-        if (l.InCombat && !inCombat) l.CalmSince = now;
-        l.InCombat = inCombat;
+        var lease = Get(key);
+        if (lease == null || lease.Owner != player) return;
+        if (lease.InCombat && !inCombat) lease.CalmSince = now;
+        lease.InCombat = inCombat;
     }
 
     public void PlayerLeft(byte player, double now)
     {
-        foreach (var l in _leases.Values)
+        foreach (var lease in _leases.Values)
         {
-            l.Subscribers.Remove(player);
-            if (l.Owner == player)
-            {
-                l.InCombat = false; // a disconnect is the one case where a fight changes hands
-                Reassign(l, now, "owner disconnected");
-            }
+            lease.Subscribers.Remove(player);
+            if (lease.Owner != player) continue;
+            lease.InCombat = false;
+            Reassign(lease, now, "owner disconnected");
         }
     }
 
     public void Tick(double now)
     {
-        foreach (var l in _leases.Values)
+        foreach (var lease in _leases.Values)
         {
-            if (l.Owner == NoOwner || l.InCombat) continue;
-            if (!l.Subscribers.Contains(l.Owner))
-            {
-                Reassign(l, now, "owner left after combat");
-                continue;
-            }
-            if (l.Owner != HostId && l.Subscribers.Contains(HostId) && now - l.CalmSince >= MigrateToHostAfter)
-                SetOwner(l, HostId, now, "migrated to host");
+            if (lease.Owner == NoOwner || lease.InCombat) continue;
+            if (!lease.Subscribers.Contains(lease.Owner)) Reassign(lease, now, "owner left after combat");
+            else if (ShouldMigrateToHost(lease, now)) SetOwner(lease, HostId, now, "migrated to host");
         }
     }
 
-    private void Reassign(Lease l, double now, string reason)
+    private Lease GetOrCreate(string key, double now)
     {
-        byte next = l.Subscribers.Contains(HostId) ? HostId : l.Subscribers.Count > 0 ? l.Subscribers.Min() : NoOwner;
-        SetOwner(l, next, now, next == NoOwner ? "dormant" : reason);
+        if (_leases.TryGetValue(key, out var lease)) return lease;
+        lease = new Lease { Key = key, CalmSince = now };
+        _leases[key] = lease;
+        return lease;
     }
 
-    private void SetOwner(Lease l, byte owner, double now, string reason)
+    private bool ShouldMigrateToHost(Lease lease, double now) =>
+        lease.Owner != HostId
+        && lease.Subscribers.Contains(HostId)
+        && now - lease.CalmSince >= MigrateToHostAfter;
+
+    private void Reassign(Lease lease, double now, string reason)
     {
-        if (l.Owner == owner) return;
-        l.Owner = owner;
-        l.Epoch++;
-        l.InCombat = false;
-        l.CalmSince = now;
-        OwnerChanged?.Invoke(l, reason);
+        byte next = NextOwner(lease);
+        SetOwner(lease, next, now, next == NoOwner ? "dormant" : reason);
+    }
+
+    private byte NextOwner(Lease lease)
+    {
+        if (lease.Subscribers.Contains(HostId)) return HostId;
+        return lease.Subscribers.Count > 0 ? lease.Subscribers.Min() : NoOwner;
+    }
+
+    private void SetOwner(Lease lease, byte owner, double now, string reason)
+    {
+        if (lease.Owner == owner) return;
+        lease.Owner = owner;
+        lease.Epoch++;
+        lease.InCombat = false;
+        lease.CalmSince = now;
+        OwnerChanged?.Invoke(lease, reason);
     }
 }

@@ -2,20 +2,6 @@ using System.Diagnostics;
 
 namespace AfallonCoop.Transport;
 
-/// <summary>Network conditions to imitate on top of a real (or loopback) transport.</summary>
-public sealed class NetConditions
-{
-    /// <summary>Added round-trip time, ms. Each side delays its own sends by half, so two conditioned peers see this ping.</summary>
-    public int PingMs;
-    /// <summary>Random extra one-way delay, 0..JitterMs.</summary>
-    public int JitterMs;
-    /// <summary>Unreliable packets lost, percent. Reliable ones are delayed by one extra round trip instead (a resend).</summary>
-    public double LossPercent;
-
-    public bool Active => PingMs > 0 || JitterMs > 0 || LossPercent > 0;
-    public override string ToString() => Active ? $"ping +{PingMs} ms, jitter {JitterMs} ms, loss {LossPercent:0.#}%" : "off";
-}
-
 /// <summary>
 /// Wraps a transport to (1) imitate latency, jitter and loss on outgoing packets and (2) count traffic per message
 /// type, both ways. Reliable packets keep their order (a late resend holds back the ones after it, as in a real
@@ -23,37 +9,22 @@ public sealed class NetConditions
 /// </summary>
 public sealed class ConditionedTransport : ITransport
 {
+    private const double ResendPenaltySeconds = 0.05;
+    private const double MillisecondsPerSecond = 1000.0;
+    private const double PercentScale = 100;
+
     private readonly ITransport _inner;
     private readonly Func<double> _clock;
-    private readonly Random _rng;
-
-    private readonly struct Pending
-    {
-        public readonly double Due; public readonly int Conn; public readonly byte[] Data; public readonly Delivery Delivery; public readonly long Order;
-        public Pending(double due, int conn, byte[] data, Delivery d, long order) { Due = due; Conn = conn; Data = data; Delivery = d; Order = order; }
-    }
-
-    private readonly List<Pending> _queue = new();
+    private readonly Random _random;
+    private readonly List<Delayed> _queue = new();
+    private readonly List<Delayed> _due = new();
     private readonly Dictionary<int, double> _lastReliableDue = new();
-    private long _order;
+    private long _nextOrder;
+
+    private readonly record struct Delayed(double Due, int Connection, byte[] Data, Delivery Delivery, long Order);
 
     public NetConditions Conditions { get; } = new();
     public TrafficStats Stats { get; } = new();
-
-    public ConditionedTransport(ITransport inner, Func<double> clock = null, int seed = 1)
-    {
-        _inner = inner;
-        var sw = Stopwatch.StartNew();
-        _clock = clock ?? (() => sw.Elapsed.TotalSeconds);
-        _rng = new Random(seed);
-        _inner.Connected += c => Connected?.Invoke(c);
-        _inner.Disconnected += (c, r) => Disconnected?.Invoke(c, r);
-        _inner.Received += (c, data) =>
-        {
-            Stats.Count(_clock(), incoming: true, data.Length > 0 ? data.Span[0] : (byte)0, data.Length);
-            Received?.Invoke(c, data);
-        };
-    }
 
     public bool IsServer => _inner.IsServer;
     public string Description => Conditions.Active ? $"{_inner.Description} [sim {Conditions}]" : _inner.Description;
@@ -61,41 +32,32 @@ public sealed class ConditionedTransport : ITransport
     public event Action<int, string> Disconnected;
     public event Action<int, ReadOnlyMemory<byte>> Received;
 
+    public ConditionedTransport(ITransport inner, Func<double> clock = null, int seed = 1)
+    {
+        _inner = inner;
+        _clock = clock ?? StopwatchClock();
+        _random = new Random(seed);
+        _inner.Connected += connection => Connected?.Invoke(connection);
+        _inner.Disconnected += (connection, reason) => Disconnected?.Invoke(connection, reason);
+        _inner.Received += OnInnerReceived;
+    }
+
     public void Send(int connection, ReadOnlySpan<byte> data, Delivery delivery)
     {
-        double now = _clock();
-        Stats.Count(now, incoming: false, data.Length > 0 ? data[0] : (byte)0, data.Length);
-        var c = Conditions;
-        if (!c.Active && _queue.Count == 0) { _inner.Send(connection, data, delivery); return; }
-
-        double delay = (c.PingMs / 2.0 + _rng.NextDouble() * c.JitterMs) / 1000.0;
-        if (delivery == Delivery.Reliable)
+        Stats.Count(_clock(), incoming: false, FirstByte(data), data.Length);
+        if (!Conditions.Active && _queue.Count == 0)
         {
-            if (c.LossPercent > 0 && _rng.NextDouble() * 100 < c.LossPercent) delay += c.PingMs / 1000.0 + 0.05; // resend
-            double due = now + delay;
-            if (_lastReliableDue.TryGetValue(connection, out var last) && due < last) due = last; // keep order
-            _lastReliableDue[connection] = due;
-            _queue.Add(new Pending(due, connection, data.ToArray(), delivery, _order++));
+            _inner.Send(connection, data, delivery);
+            return;
         }
-        else
-        {
-            if (c.LossPercent > 0 && _rng.NextDouble() * 100 < c.LossPercent) { Stats.Dropped++; return; }
-            _queue.Add(new Pending(now + delay, connection, data.ToArray(), delivery, _order++));
-        }
+        if (delivery == Delivery.Reliable) ScheduleReliable(connection, data);
+        else ScheduleUnreliable(connection, data, delivery);
     }
 
     public void Poll()
     {
-        if (_queue.Count > 0)
-        {
-            double now = _clock();
-            var due = _queue.Where(p => p.Due <= now).OrderBy(p => p.Due).ThenBy(p => p.Order).ToList();
-            if (due.Count > 0)
-            {
-                _queue.RemoveAll(p => p.Due <= now);
-                foreach (var p in due) _inner.Send(p.Conn, p.Data, p.Delivery);
-            }
-        }
+        SendDuePackets();
+        if (_queue.Count == 0) _lastReliableDue.Clear();
         _inner.Poll();
     }
 
@@ -103,43 +65,71 @@ public sealed class ConditionedTransport : ITransport
 
     public int GetPing(int connection)
     {
-        int p = _inner.GetPing(connection);
-        return p < 0 ? p : p + Conditions.PingMs;
+        int ping = _inner.GetPing(connection);
+        return ping < 0 ? ping : ping + Conditions.PingMs;
     }
 
     public void Dispose() => _inner.Dispose();
-}
 
-/// <summary>Bytes and packets per message type (first byte), in and out, over a sliding window.</summary>
-public sealed class TrafficStats
-{
-    private const double Window = 5.0;
-    private readonly Queue<(double t, bool inc, byte type, int bytes)> _log = new();
-    public long TotalOut, TotalIn;
-    public int Dropped;
-
-    public void Count(double now, bool incoming, byte type, int bytes)
+    private static Func<double> StopwatchClock()
     {
-        if (incoming) TotalIn += bytes; else TotalOut += bytes;
-        _log.Enqueue((now, incoming, type, bytes));
-        while (_log.Count > 0 && now - _log.Peek().t > Window) _log.Dequeue();
+        var stopwatch = Stopwatch.StartNew();
+        return () => stopwatch.Elapsed.TotalSeconds;
     }
 
-    /// <summary>Per type and direction: bytes per second over the last few seconds.</summary>
-    public List<(byte type, bool incoming, double bytesPerSecond)> Rates() =>
-        _log.GroupBy(e => (e.type, e.inc)).Select(g => (g.Key.type, g.Key.inc, g.Sum(e => e.bytes) / Window)).ToList();
-
-    /// <summary>Per type: bytes/s and packets/s out and in, averaged over the last few seconds.</summary>
-    public string Report(Func<byte, string> typeName)
+    private void OnInnerReceived(int connection, ReadOnlyMemory<byte> data)
     {
-        var rows = _log.GroupBy(e => (e.type, e.inc))
-            .Select(g => (g.Key.type, g.Key.inc, bps: g.Sum(e => e.bytes) / Window, pps: g.Count() / Window, avg: g.Average(e => e.bytes)))
-            .OrderByDescending(r => r.bps).ToList();
-        var sb = new System.Text.StringBuilder();
-        double outBps = rows.Where(r => !r.inc).Sum(r => r.bps), inBps = rows.Where(r => r.inc).Sum(r => r.bps);
-        sb.AppendLine($"total out {outBps / 1024:0.0} KB/s, in {inBps / 1024:0.0} KB/s (last {Window:0} s); lost by sim: {Dropped}");
-        foreach (var r in rows)
-            sb.AppendLine($"  {(r.inc ? "in " : "out")} {typeName(r.type),-12} {r.bps / 1024,6:0.00} KB/s  {r.pps,6:0.0} pkt/s  avg {r.avg,5:0} B");
-        return sb.ToString();
+        Stats.Count(_clock(), incoming: true, FirstByte(data.Span), data.Length);
+        Received?.Invoke(connection, data);
     }
+
+    private static byte FirstByte(ReadOnlySpan<byte> data) => data.Length > 0 ? data[0] : (byte)0;
+
+    private void ScheduleReliable(int connection, ReadOnlySpan<byte> data)
+    {
+        double delay = OneWayDelay();
+        if (IsLost()) delay += Conditions.PingMs / MillisecondsPerSecond + ResendPenaltySeconds;
+        double due = Math.Max(_clock() + delay, LastReliableDue(connection));
+        _lastReliableDue[connection] = due;
+        Enqueue(due, connection, data, Delivery.Reliable);
+    }
+
+    private void ScheduleUnreliable(int connection, ReadOnlySpan<byte> data, Delivery delivery)
+    {
+        double delay = OneWayDelay();
+        if (IsLost())
+        {
+            Stats.Dropped++;
+            return;
+        }
+        Enqueue(_clock() + delay, connection, data, delivery);
+    }
+
+    private double OneWayDelay() =>
+        (Conditions.PingMs / 2.0 + _random.NextDouble() * Conditions.JitterMs) / MillisecondsPerSecond;
+
+    private bool IsLost() =>
+        Conditions.LossPercent > 0 && _random.NextDouble() * PercentScale < Conditions.LossPercent;
+
+    private double LastReliableDue(int connection) =>
+        _lastReliableDue.TryGetValue(connection, out double last) ? last : double.MinValue;
+
+    private void Enqueue(double due, int connection, ReadOnlySpan<byte> data, Delivery delivery) =>
+        _queue.Add(new Delayed(due, connection, data.ToArray(), delivery, _nextOrder++));
+
+    private void SendDuePackets()
+    {
+        if (_queue.Count == 0) return;
+        double now = _clock();
+        _due.Clear();
+        foreach (var packet in _queue)
+            if (packet.Due <= now) _due.Add(packet);
+        if (_due.Count == 0) return;
+        _queue.RemoveAll(packet => packet.Due <= now);
+        _due.Sort(CompareByDueThenOrder);
+        foreach (var packet in _due) _inner.Send(packet.Connection, packet.Data, packet.Delivery);
+    }
+
+    private static int CompareByDueThenOrder(Delayed first, Delayed second) =>
+        first.Due != second.Due ? first.Due.CompareTo(second.Due) : first.Order.CompareTo(second.Order);
 }

@@ -3,24 +3,28 @@ namespace AfallonCoop.Transport;
 /// <summary>In-memory transport for tests: a hub plays the host, each client gets its own endpoint.</summary>
 public sealed class LoopbackHub
 {
-    internal readonly LoopbackTransport Server;
     private readonly List<LoopbackTransport> _clients = new();
-    private int _nextId = 1;
+    private int _nextClientId = 1;
 
-    public LoopbackHub() { Server = new LoopbackTransport(this, isServer: true, 0); }
+    internal LoopbackTransport Server { get; }
+
+    public LoopbackHub()
+    {
+        Server = new LoopbackTransport(this, isServer: true, id: 0);
+    }
 
     public ITransport Host => Server;
 
     public ITransport Connect()
     {
-        var c = new LoopbackTransport(this, isServer: false, _nextId++);
-        _clients.Add(c);
-        c.Enqueue(() => c.RaiseConnected(ITransport.ServerConnection));
-        Server.Enqueue(() => Server.RaiseConnected(c.Id));
-        return c;
+        var client = new LoopbackTransport(this, isServer: false, _nextClientId++);
+        _clients.Add(client);
+        client.Enqueue(() => client.RaiseConnected(ITransport.ServerConnection));
+        Server.Enqueue(() => Server.RaiseConnected(client.Id));
+        return client;
     }
 
-    internal LoopbackTransport Client(int id) => _clients.FirstOrDefault(c => c.Id == id && !c.Closed);
+    internal LoopbackTransport OpenClient(int id) => _clients.FirstOrDefault(client => client.Id == id && !client.Closed);
 
     internal void Drop(LoopbackTransport client, string reason)
     {
@@ -35,10 +39,9 @@ public sealed class LoopbackTransport : ITransport
 {
     private readonly LoopbackHub _hub;
     private readonly Queue<Action> _inbox = new();
-    internal readonly int Id;
-    internal bool Closed;
 
-    internal LoopbackTransport(LoopbackHub hub, bool isServer, int id) { _hub = hub; IsServer = isServer; Id = id; }
+    internal int Id { get; }
+    internal bool Closed { get; set; }
 
     public bool IsServer { get; }
     public string Description => IsServer ? "loopback host" : $"loopback client {Id}";
@@ -46,39 +49,62 @@ public sealed class LoopbackTransport : ITransport
     public event Action<int, string> Disconnected;
     public event Action<int, ReadOnlyMemory<byte>> Received;
 
-    internal void Enqueue(Action a) => _inbox.Enqueue(a);
-    internal void RaiseConnected(int c) => Connected?.Invoke(c);
-    internal void RaiseDisconnected(int c, string r) => Disconnected?.Invoke(c, r);
+    internal LoopbackTransport(LoopbackHub hub, bool isServer, int id)
+    {
+        _hub = hub;
+        IsServer = isServer;
+        Id = id;
+    }
 
+    /// <summary>Only what was queued before this poll runs, like a real network tick.</summary>
     public void Poll()
     {
-        int n = _inbox.Count; // only what was queued before this poll, like a real network tick
-        while (n-- > 0) _inbox.Dequeue()();
+        int queued = _inbox.Count;
+        while (queued-- > 0) _inbox.Dequeue()();
     }
 
     public void Send(int connection, ReadOnlySpan<byte> data, Delivery delivery)
     {
         if (Closed) return;
         var copy = data.ToArray();
-        if (IsServer)
-        {
-            var c = _hub.Client(connection);
-            c?.Enqueue(() => c.Received?.Invoke(ITransport.ServerConnection, copy));
-        }
-        else
-        {
-            var s = _hub.Server;
-            int from = Id;
-            s.Enqueue(() => s.Received?.Invoke(from, copy));
-        }
+        if (IsServer) SendToClient(connection, copy);
+        else SendToServer(copy);
     }
 
     public void Disconnect(int connection, string reason)
     {
-        if (IsServer) { var c = _hub.Client(connection); if (c != null) _hub.Drop(c, reason); }
-        else _hub.Drop(this, reason);
+        if (!IsServer)
+        {
+            _hub.Drop(this, reason);
+            return;
+        }
+        var client = _hub.OpenClient(connection);
+        if (client != null) _hub.Drop(client, reason);
     }
 
     public int GetPing(int connection) => 0;
-    public void Dispose() { if (!IsServer) _hub.Drop(this, "disposed"); }
+
+    public void Dispose()
+    {
+        if (!IsServer) _hub.Drop(this, "disposed");
+    }
+
+    internal void Enqueue(Action action) => _inbox.Enqueue(action);
+
+    internal void RaiseConnected(int connection) => Connected?.Invoke(connection);
+
+    internal void RaiseDisconnected(int connection, string reason) => Disconnected?.Invoke(connection, reason);
+
+    private void SendToClient(int connection, byte[] data)
+    {
+        var client = _hub.OpenClient(connection);
+        client?.Enqueue(() => client.Received?.Invoke(ITransport.ServerConnection, data));
+    }
+
+    private void SendToServer(byte[] data)
+    {
+        var server = _hub.Server;
+        int sender = Id;
+        server.Enqueue(() => server.Received?.Invoke(sender, data));
+    }
 }

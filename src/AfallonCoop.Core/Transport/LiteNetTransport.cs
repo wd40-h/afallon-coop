@@ -1,26 +1,36 @@
 using System.Net;
 using System.Text;
 using LiteNetLib;
+using LiteNetLib.Utils;
 
 namespace AfallonCoop.Transport;
 
 /// <summary>
 /// UDP transport over LiteNetLib: LAN, direct IP, and virtual LANs (Radmin VPN, ZeroTier, Hamachi, Tailscale).
+/// Connection ids on the host are LiteNetLib peer ids + 1, so 0 stays free for "the server" on clients.
 /// </summary>
 public sealed class LiteNetTransport : ITransport
 {
     public const int DefaultPort = 27555;
+
     private const string ConnectKey = "AfallonCoop/1";
-    private static readonly byte[] DiscoverProbe = Encoding.ASCII.GetBytes("AFCOOP?");
     private const string DiscoverReplyPrefix = "AFCOOP!";
+    private const int DisconnectTimeoutMs = 10000;
+    private const int UpdateIntervalMs = 15;
+    private const int DiscoveryPollIntervalMs = 30;
+    private static readonly byte[] DiscoverProbe = Encoding.ASCII.GetBytes("AFCOOP?");
 
     private readonly EventBasedNetListener _listener = new();
     private readonly NetManager _net;
     private readonly Dictionary<int, NetPeer> _peers = new();
     private NetPeer _server;
+    private bool _warnedTooBig;
 
     /// <summary>Host only: text returned to LAN discovery probes (game name, player count).</summary>
     public Func<string> DiscoveryInfo { get; set; }
+
+    /// <summary>Diagnostics (oversized packets...).</summary>
+    public Action<string> Log;
 
     public bool IsServer { get; }
     public string Description { get; }
@@ -37,104 +47,126 @@ public sealed class LiteNetTransport : ITransport
             AutoRecycle = true,
             UnconnectedMessagesEnabled = true,
             BroadcastReceiveEnabled = server,
-            DisconnectTimeout = 10000,
-            UpdateTime = 15,
+            DisconnectTimeout = DisconnectTimeoutMs,
+            UpdateTime = UpdateIntervalMs,
         };
-        _listener.ConnectionRequestEvent += req =>
-        {
-            if (IsServer) req.AcceptIfKey(ConnectKey); else req.Reject();
-        };
-        _listener.PeerConnectedEvent += peer =>
-        {
-            if (IsServer) { _peers[peer.Id + 1] = peer; Connected?.Invoke(peer.Id + 1); }
-            else { _server = peer; Connected?.Invoke(ITransport.ServerConnection); }
-        };
-        _listener.PeerDisconnectedEvent += (peer, info) =>
-        {
-            string reason = info.Reason.ToString();
-            if (info.AdditionalData != null && info.AdditionalData.AvailableBytes > 0)
-            {
-                try { reason = info.AdditionalData.GetString(); } catch { /* keep enum reason */ }
-            }
-            if (IsServer) { _peers.Remove(peer.Id + 1); Disconnected?.Invoke(peer.Id + 1, reason); }
-            else { _server = null; Disconnected?.Invoke(ITransport.ServerConnection, reason); }
-        };
-        _listener.NetworkReceiveEvent += (peer, reader, channel, method) =>
-        {
-            var data = reader.GetRemainingBytes();
-            Received?.Invoke(IsServer ? peer.Id + 1 : ITransport.ServerConnection, data);
-        };
-        _listener.NetworkReceiveUnconnectedEvent += (endPoint, reader, type) =>
-        {
-            var bytes = reader.GetRemainingBytes();
-            if (IsServer && bytes.AsSpan().SequenceEqual(DiscoverProbe))
-            {
-                var reply = Encoding.UTF8.GetBytes(DiscoverReplyPrefix + (DiscoveryInfo?.Invoke() ?? ""));
-                _net.SendUnconnectedMessage(reply, endPoint);
-            }
-        };
+        _listener.ConnectionRequestEvent += OnConnectionRequest;
+        _listener.PeerConnectedEvent += OnPeerConnected;
+        _listener.PeerDisconnectedEvent += OnPeerDisconnected;
+        _listener.NetworkReceiveEvent += OnNetworkReceive;
+        _listener.NetworkReceiveUnconnectedEvent += OnUnconnectedReceive;
     }
-
-    // Connection ids on the host are LiteNetLib peer ids + 1, so 0 stays free for "the server" on clients.
 
     public static LiteNetTransport Host(int port)
     {
-        var t = new LiteNetTransport(true, $"LAN/IP host :{port}");
-        if (!t._net.Start(port))
+        var transport = new LiteNetTransport(true, $"LAN/IP host :{port}");
+        if (!transport._net.Start(port))
             throw new InvalidOperationException($"Port {port} is busy. Close the other game copy or pick another port.");
-        return t;
+        return transport;
     }
 
     public static LiteNetTransport Connect(string host, int port)
     {
-        var t = new LiteNetTransport(false, $"LAN/IP {host}:{port}");
-        if (!t._net.Start()) throw new InvalidOperationException("Could not open a UDP socket.");
-        t._net.Connect(host, port, ConnectKey);
-        return t;
+        var transport = new LiteNetTransport(false, $"LAN/IP {host}:{port}");
+        if (!transport._net.Start()) throw new InvalidOperationException("Could not open a UDP socket.");
+        transport._net.Connect(host, port, ConnectKey);
+        return transport;
     }
 
     public void Poll() => _net.PollEvents();
 
     public void Send(int connection, ReadOnlySpan<byte> data, Delivery delivery)
     {
-        var peer = IsServer ? (_peers.TryGetValue(connection, out var p) ? p : null) : _server;
+        var peer = PeerOf(connection);
         if (peer == null) return;
-        var method = delivery switch
-        {
-            Delivery.Reliable => DeliveryMethod.ReliableOrdered,
-            Delivery.Unreliable => DeliveryMethod.Sequenced,
-            _ => DeliveryMethod.Unreliable,
-        };
-        if (method != DeliveryMethod.ReliableOrdered && data.Length > peer.GetMaxSinglePacketSize(method))
-        {
-            // A bug on the sender's side (packet budget), not a network fault: drop it, say so once.
-            if (!_warnedTooBig) { _warnedTooBig = true; Log?.Invoke($"Dropped an unreliable packet of {data.Length} bytes (max {peer.GetMaxSinglePacketSize(method)})"); }
-            return;
-        }
+        var method = MethodFor(delivery);
+        if (ExceedsSinglePacket(peer, method, data.Length)) return;
         peer.Send(data, 0, method);
     }
 
-    private bool _warnedTooBig;
-
-    /// <summary>Diagnostics (oversized packets...).</summary>
-    public Action<string> Log;
-
     public void Disconnect(int connection, string reason)
     {
-        var peer = IsServer ? (_peers.TryGetValue(connection, out var p) ? p : null) : _server;
+        var peer = PeerOf(connection);
         if (peer == null) return;
-        var w = new LiteNetLib.Utils.NetDataWriter();
-        w.Put(reason ?? "");
-        peer.Disconnect(w);
+        var writer = new NetDataWriter();
+        writer.Put(reason ?? "");
+        peer.Disconnect(writer);
     }
 
-    public int GetPing(int connection)
-    {
-        var peer = IsServer ? (_peers.TryGetValue(connection, out var p) ? p : null) : _server;
-        return peer?.Ping ?? -1;
-    }
+    public int GetPing(int connection) => PeerOf(connection)?.Ping ?? -1;
 
     public void Dispose() => _net.Stop(true);
+
+    private NetPeer PeerOf(int connection)
+    {
+        if (!IsServer) return _server;
+        return _peers.TryGetValue(connection, out var peer) ? peer : null;
+    }
+
+    private int ConnectionIdOf(NetPeer peer) => IsServer ? peer.Id + 1 : ITransport.ServerConnection;
+
+    private static DeliveryMethod MethodFor(Delivery delivery) => delivery switch
+    {
+        Delivery.Reliable => DeliveryMethod.ReliableOrdered,
+        Delivery.Unreliable => DeliveryMethod.Sequenced,
+        _ => DeliveryMethod.Unreliable,
+    };
+
+    /// <summary>An oversized unreliable packet is a sender bug (packet budget), not a network fault: drop it, say so once.</summary>
+    private bool ExceedsSinglePacket(NetPeer peer, DeliveryMethod method, int length)
+    {
+        if (method == DeliveryMethod.ReliableOrdered) return false;
+        int max = peer.GetMaxSinglePacketSize(method);
+        if (length <= max) return false;
+        if (_warnedTooBig) return true;
+        _warnedTooBig = true;
+        Log?.Invoke($"Dropped an unreliable packet of {length} bytes (max {max})");
+        return true;
+    }
+
+    private void OnConnectionRequest(ConnectionRequest request)
+    {
+        if (IsServer) request.AcceptIfKey(ConnectKey);
+        else request.Reject();
+    }
+
+    private void OnPeerConnected(NetPeer peer)
+    {
+        if (IsServer) _peers[ConnectionIdOf(peer)] = peer;
+        else _server = peer;
+        Connected?.Invoke(ConnectionIdOf(peer));
+    }
+
+    private void OnPeerDisconnected(NetPeer peer, DisconnectInfo info)
+    {
+        int connection = ConnectionIdOf(peer);
+        if (IsServer) _peers.Remove(connection);
+        else _server = null;
+        Disconnected?.Invoke(connection, ReasonOf(info));
+    }
+
+    private static string ReasonOf(DisconnectInfo info)
+    {
+        bool hasReasonText = info.AdditionalData != null && info.AdditionalData.AvailableBytes > 0;
+        if (!hasReasonText) return info.Reason.ToString();
+        try { return info.AdditionalData.GetString(); }
+        catch { return info.Reason.ToString(); }
+    }
+
+    /// <summary>No copy: the bytes are valid during the callback (the session reads them there).</summary>
+    private void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channel, DeliveryMethod method)
+    {
+        var segment = reader.GetRemainingBytesSegment();
+        Received?.Invoke(ConnectionIdOf(peer), new ReadOnlyMemory<byte>(segment.Array, segment.Offset, segment.Count));
+    }
+
+    private void OnUnconnectedReceive(IPEndPoint endPoint, NetPacketReader reader, UnconnectedMessageType type)
+    {
+        if (!IsServer) return;
+        if (!reader.GetRemainingBytes().AsSpan().SequenceEqual(DiscoverProbe)) return;
+        var reply = Encoding.UTF8.GetBytes(DiscoverReplyPrefix + (DiscoveryInfo?.Invoke() ?? ""));
+        _net.SendUnconnectedMessage(reply, endPoint);
+    }
 
     /// <summary>A host found by LAN broadcast.</summary>
     public sealed record LanHost(string Address, int Port, string Info);
@@ -145,27 +177,34 @@ public sealed class LiteNetTransport : ITransport
         var found = new List<LanHost>();
         var listener = new EventBasedNetListener();
         var net = new NetManager(listener) { UnconnectedMessagesEnabled = true, BroadcastReceiveEnabled = false };
-        listener.NetworkReceiveUnconnectedEvent += (ep, reader, type) =>
-        {
-            var s = Encoding.UTF8.GetString(reader.GetRemainingBytes());
-            if (!s.StartsWith(DiscoverReplyPrefix)) return;
-            if (found.Any(f => f.Address == ep.Address.ToString() && f.Port == ep.Port)) return;
-            found.Add(new LanHost(ep.Address.ToString(), ep.Port, s.Substring(DiscoverReplyPrefix.Length)));
-        };
+        listener.NetworkReceiveUnconnectedEvent += (endPoint, reader, type) => CollectReply(found, endPoint, reader);
         if (!net.Start()) return found;
         try
         {
             net.SendBroadcast(DiscoverProbe, port);
-            // Also probe localhost, so a second game copy on the same PC finds the first one.
+            // also localhost, so a second game copy on the same PC finds the first one
             net.SendUnconnectedMessage(DiscoverProbe, new IPEndPoint(IPAddress.Loopback, port));
-            var until = DateTime.UtcNow.AddMilliseconds(waitMs);
-            while (DateTime.UtcNow < until)
-            {
-                net.PollEvents();
-                await Task.Delay(30).ConfigureAwait(false);
-            }
+            await PollUntil(net, DateTime.UtcNow.AddMilliseconds(waitMs)).ConfigureAwait(false);
         }
         finally { net.Stop(); }
         return found;
+    }
+
+    private static void CollectReply(List<LanHost> found, IPEndPoint endPoint, NetPacketReader reader)
+    {
+        string text = Encoding.UTF8.GetString(reader.GetRemainingBytes());
+        if (!text.StartsWith(DiscoverReplyPrefix)) return;
+        string address = endPoint.Address.ToString();
+        if (found.Any(host => host.Address == address && host.Port == endPoint.Port)) return;
+        found.Add(new LanHost(address, endPoint.Port, text.Substring(DiscoverReplyPrefix.Length)));
+    }
+
+    private static async Task PollUntil(NetManager net, DateTime deadline)
+    {
+        while (DateTime.UtcNow < deadline)
+        {
+            net.PollEvents();
+            await Task.Delay(DiscoveryPollIntervalMs).ConfigureAwait(false);
+        }
     }
 }
