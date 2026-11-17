@@ -298,7 +298,7 @@ internal static class MainMenuUI
 
     private static void BuildMain()
     {
-        Title("AFNOTALLON");
+        Title("AFALLONCOOP");
         Line("Play the world together, up to 5 players.", 20, DimColor);
         Gap();
         Btn("HOST GAME", () => Go(Page.Host));

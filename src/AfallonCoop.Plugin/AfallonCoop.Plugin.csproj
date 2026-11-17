@@ -10,7 +10,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>AfallonCoop.Plugin</RootNamespace>
     <AssemblyName>AfallonCoop</AssemblyName>
-    <Version>0.6.0</Version>
+    <Version>0.7.0</Version>
     <!-- Path to the game; override with -p:GameDir=... -->
     <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Afallon</GameDir>
     <BepInExDir>$(GameDir)\BepInEx</BepInExDir>
@@ -65,11 +65,11 @@
   </Target>
 
   <!-- Release archive, the mod only (players install BepInEx themselves): dotnet build -c Release -p:Package=true
-       -> dist/AfNotAllon-<Version>.zip with BepInEx/plugins/AfallonCoop/... and the README, unzipped into the game folder -->
+       -> dist/AfallonCoop-<Version>.zip with BepInEx/plugins/AfallonCoop/... and the README, unzipped into the game folder -->
   <Target Name="Package" AfterTargets="Build" Condition="'$(Package)' == 'true'">
     <PropertyGroup>
       <PackageDir>$(BaseIntermediateOutputPath)package\</PackageDir>
-      <PackageZip>$(MSBuildProjectDirectory)\..\..\dist\AfNotAllon-$(Version).zip</PackageZip>
+      <PackageZip>$(MSBuildProjectDirectory)\..\..\dist\AfallonCoop-$(Version).zip</PackageZip>
     </PropertyGroup>
     <RemoveDir Directories="$(PackageDir)" />
     <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(PackageDir)BepInEx\plugins\AfallonCoop" />

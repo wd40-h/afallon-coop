@@ -28,7 +28,7 @@ This is an unofficial fan mod. Afallon belongs to its developers.
 - **BepInEx 6 Bleeding Edge, IL2CPP, build #788** (the mod loader). Other BepInEx versions are not tested.
   Download: [BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.788+5b766a3.zip](https://builds.bepinex.dev/projects/bepinex_be/788/BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.788%2B5b766a3.zip)
   (from [builds.bepinex.dev](https://builds.bepinex.dev/projects/bepinex_be)).
-- **The mod:** `AfNotAllon-<version>.zip` from this repository's [Releases](../../releases).
+- **The mod:** `AfallonCoop-<version>.zip` from this repository's [Releases](../../releases).
 
 ### Steps
 1. Open the game folder: in Steam, right-click Afallon > Manage > Browse local files. It is the folder with `Afallon.exe`.
@@ -98,7 +98,7 @@ Runs the tests of the network core (sessions, groups, ownership of mobs, passwor
    ```
    dotnet build src/AfallonCoop.Plugin -c Release -p:Package=true -p:Deploy=false
    ```
-   It writes `dist/AfNotAllon-<version>.zip`, laid out to be unzipped into the game folder:
+   It writes `dist/AfallonCoop-<version>.zip`, laid out to be unzipped into the game folder:
    ```
    README.md
    BepInEx/plugins/AfallonCoop/AfallonCoop.dll
@@ -130,6 +130,9 @@ Runs the tests of the network core (sessions, groups, ownership of mobs, passwor
 The mod's code is under the [MIT license](LICENSE). BepInEx, LiteNetLib and Steamworks.NET keep their own licenses.
 
 ## Changelog
+- **0.7.0:**
+  - Renamed the mod to AfallonCoop, including the release archive name (`AfallonCoop-<version>.zip`) and the in-game
+    title. Every player must update to the same version.
 - **0.6.0:**
   - Fixes: no more lost items or gold when the host is on a loading screen; trades that freeze when someone
     disconnects give the items back; a loot roll won by a player who left reaches them by mail; auction mail is no
