@@ -130,6 +130,10 @@ Runs the tests of the network core (sessions, groups, ownership of mobs, passwor
 The mod's code is under the [MIT license](LICENSE). BepInEx, LiteNetLib and Steamworks.NET keep their own licenses.
 
 ## Changelog
+- **0.7.1:**
+  - Internal cleanup, with no behaviour change: the host's join checks (protocol, game build, password, ban list, an
+    already-connected peer and a full session) now live in their own class. Everyone needs the same version to play
+    together.
 - **0.7.0:**
   - Renamed the mod to AfallonCoop, including the release archive name (`AfallonCoop-<version>.zip`) and the in-game
     title. Everyone needs the same version to play together.

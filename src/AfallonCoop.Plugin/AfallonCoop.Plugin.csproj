@@ -10,7 +10,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>AfallonCoop.Plugin</RootNamespace>
     <AssemblyName>AfallonCoop</AssemblyName>
-    <Version>0.7.0</Version>
+    <Version>0.7.1</Version>
     <!-- Path to the game; override with -p:GameDir=... -->
     <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Afallon</GameDir>
     <BepInExDir>$(GameDir)\BepInEx</BepInExDir>
