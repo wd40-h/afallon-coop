@@ -1,4 +1,5 @@
 using AfallonCoop.Protocol;
+using AfallonCoop.World;
 
 namespace AfallonCoop.Session;
 
@@ -22,6 +23,26 @@ internal sealed class GroupDirectory
         _groups.Clear();
         int groupCount = reader.U8();
         for (int i = 0; i < groupCount; i++) _groups.Add(ReadGroup(ref reader));
+    }
+
+    public static void Write(NetWriter writer, IReadOnlyList<GroupRegistry.Group> groups)
+    {
+        writer.U8((byte)groups.Count);
+        foreach (var group in groups) WriteGroup(writer, group);
+    }
+
+    private static void WriteGroup(NetWriter writer, GroupRegistry.Group group)
+    {
+        writer.U8(group.Id);
+        writer.Str(group.LeaderKey);
+        writer.U8((byte)group.Members.Count);
+        foreach (var member in group.Members)
+        {
+            writer.Str(member.Key);
+            writer.Str(member.Name);
+            writer.U8(member.Id);
+            writer.U8((byte)Math.Clamp(member.Bots, 0, byte.MaxValue));
+        }
     }
 
     private static GroupInfo ReadGroup(ref NetReader reader)

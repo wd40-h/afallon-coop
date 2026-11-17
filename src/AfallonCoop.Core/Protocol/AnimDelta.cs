@@ -19,22 +19,33 @@ public sealed class AnimDeltaEncoder
     /// (one per mob) do not all send a full set in the same tick.</param>
     public AnimDeltaEncoder(double phase = 0) { _phase = phase; }
 
-    public void Reset() { _sent.Clear(); _nextKeyframe = double.NegativeInfinity; }
+    public void Reset()
+    {
+        _sent.Clear();
+        _nextKeyframe = double.NegativeInfinity;
+    }
 
     /// <summary>Reduce a full parameter sample to what must be sent now. Returns true when it is a keyframe.</summary>
     public bool Encode(double now, List<AnimParam> all, List<AnimParam> toSend)
     {
         toSend.Clear();
-        bool key = now >= _nextKeyframe;
-        if (key) _nextKeyframe = now + KeyframeInterval * (double.IsNegativeInfinity(_nextKeyframe) ? 1 + _phase : 1);
-        foreach (var p in all)
+        bool isKeyframe = now >= _nextKeyframe;
+        if (isKeyframe) ScheduleNextKeyframe(now);
+        foreach (var param in all)
         {
-            bool changed = !_sent.TryGetValue(p.NameHash, out var s) || Math.Abs(s.value - p.Value) > Epsilon;
-            int resend = changed ? Redundancy : s.resend;
-            if (key || resend > 0) toSend.Add(p);
-            _sent[p.NameHash] = (changed ? p.Value : s.value, Math.Max(0, resend - 1));
+            bool changed = !_sent.TryGetValue(param.NameHash, out var sent) || Math.Abs(sent.value - param.Value) > Epsilon;
+            int resendsLeft = changed ? Redundancy : sent.resend;
+            if (isKeyframe || resendsLeft > 0) toSend.Add(param);
+            _sent[param.NameHash] = (changed ? param.Value : sent.value, Math.Max(0, resendsLeft - 1));
         }
-        return key;
+        return isKeyframe;
+    }
+
+    private void ScheduleNextKeyframe(double now)
+    {
+        bool isFirstKeyframe = double.IsNegativeInfinity(_nextKeyframe);
+        double intervals = isFirstKeyframe ? 1 + _phase : 1;
+        _nextKeyframe = now + KeyframeInterval * intervals;
     }
 }
 
@@ -46,13 +57,24 @@ public sealed class AnimParamState
 
     public void Apply(List<AnimParam> received, bool keyframe)
     {
-        if (keyframe) { _index.Clear(); Current.Clear(); }
-        foreach (var p in received)
-        {
-            if (_index.TryGetValue(p.NameHash, out int i)) Current[i] = p;
-            else { _index[p.NameHash] = Current.Count; Current.Add(p); }
-        }
+        if (keyframe) Clear();
+        foreach (var param in received) Set(param);
     }
 
-    public void Clear() { _index.Clear(); Current.Clear(); }
+    public void Clear()
+    {
+        _index.Clear();
+        Current.Clear();
+    }
+
+    private void Set(AnimParam param)
+    {
+        if (_index.TryGetValue(param.NameHash, out int position))
+        {
+            Current[position] = param;
+            return;
+        }
+        _index[param.NameHash] = Current.Count;
+        Current.Add(param);
+    }
 }

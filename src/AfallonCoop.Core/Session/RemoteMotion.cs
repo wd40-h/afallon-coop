@@ -5,8 +5,17 @@ namespace AfallonCoop.Session;
 public struct V3
 {
     public float X, Y, Z;
-    public V3(float x, float y, float z) { X = x; Y = y; Z = z; }
-    public static V3 Lerp(V3 a, V3 b, float t) => new(a.X + (b.X - a.X) * t, a.Y + (b.Y - a.Y) * t, a.Z + (b.Z - a.Z) * t);
+
+    public V3(float x, float y, float z)
+    {
+        X = x;
+        Y = y;
+        Z = z;
+    }
+
+    public static V3 Lerp(V3 from, V3 to, float t) =>
+        new(from.X + (to.X - from.X) * t, from.Y + (to.Y - from.Y) * t, from.Z + (to.Z - from.Z) * t);
+
     public override string ToString() => $"({X:0.00}, {Y:0.00}, {Z:0.00})";
 }
 
@@ -17,71 +26,106 @@ public struct V3
 /// </summary>
 public sealed class RemoteMotion
 {
-    public double Delay = 0.12;           // seconds behind the sender; > send interval (1/15 s) + typical jitter
-    public double MaxExtrapolation = 0.25;
     public const int Capacity = 32;
 
-    private readonly List<PlayerStateMsg> _buf = new(Capacity);
-    private double _offset = double.NaN;  // localTime - senderTime, minimum seen (drifts up slowly)
+    private const double OffsetDriftRate = 0.02;
+    private const double MinimumSampleSpan = 1e-6;
+    private const float HalfTurnDegrees = 180f;
+    private const float FullTurnDegrees = 360f;
+
+    private readonly List<PlayerStateMsg> _samples = new(Capacity);
+    private double _clockOffset = double.NaN;
+
+    /// <summary>Seconds behind the sender: more than the send interval (1/15 s) plus typical jitter.</summary>
+    public double Delay = 0.12;
+    public double MaxExtrapolation = 0.25;
 
     public PlayerStateMsg Latest { get; private set; }
-    public int Count => _buf.Count;
+    public int Count => _samples.Count;
 
-    public void Add(PlayerStateMsg m, double localNow)
+    public void Add(PlayerStateMsg sample, double localNow)
     {
-        if (Latest != null && m.Seq <= Latest.Seq && Latest.Seq - m.Seq < uint.MaxValue / 2) return; // old or duplicate
-        double o = localNow - m.SenderTime;
-        if (double.IsNaN(_offset) || o < _offset) _offset = o;
-        else _offset += (o - _offset) * 0.02; // clock drift and route changes
-
-        Latest = m;
-        _buf.Add(m);
-        if (_buf.Count > Capacity) _buf.RemoveAt(0);
+        if (IsOldOrDuplicate(sample)) return;
+        TrackClockOffset(localNow - sample.SenderTime);
+        Latest = sample;
+        _samples.Add(sample);
+        if (_samples.Count > Capacity) _samples.RemoveAt(0);
     }
 
     /// <summary>
     /// The sender's time of the pose shown at <paramref name="localNow"/> (what this machine sees of them now), on the
     /// sender's own clock; NaN before the first sample. Lag compensation: the sender checks a hit against where it was then.
     /// </summary>
-    public double ViewTime(double localNow) => double.IsNaN(_offset) ? double.NaN : localNow - _offset - Delay;
+    public double ViewTime(double localNow) => double.IsNaN(_clockOffset) ? double.NaN : SenderTimeAt(localNow);
 
     /// <summary>Pose to show at <paramref name="localNow"/>. False until the first sample arrives.</summary>
     public bool Sample(double localNow, out V3 pos, out float rotY)
     {
-        pos = default; rotY = 0;
-        if (_buf.Count == 0) return false;
-        double t = localNow - _offset - Delay; // in sender time
-
-        var first = _buf[0];
-        if (t <= first.SenderTime) { pos = P(first); rotY = first.RotY; return true; }
-
-        for (int i = _buf.Count - 1; i > 0; i--)
-        {
-            var a = _buf[i - 1];
-            var b = _buf[i];
-            if (t >= a.SenderTime && t <= b.SenderTime)
-            {
-                double span = b.SenderTime - a.SenderTime;
-                float k = span <= 1e-6 ? 1f : (float)((t - a.SenderTime) / span);
-                pos = V3.Lerp(P(a), P(b), k);
-                rotY = LerpAngle(a.RotY, b.RotY, k);
-                return true;
-            }
-        }
-
-        // Past the newest sample: extrapolate briefly along velocity, then hold.
-        var last = _buf[^1];
-        float dt = (float)Math.Min(t - last.SenderTime, MaxExtrapolation);
-        pos = new V3(last.PosX + last.VelX * dt, last.PosY + last.VelY * dt, last.PosZ + last.VelZ * dt);
-        rotY = last.RotY;
+        pos = default;
+        rotY = 0;
+        if (_samples.Count == 0) return false;
+        double time = SenderTimeAt(localNow);
+        if (time <= _samples[0].SenderTime) HoldPose(_samples[0], out pos, out rotY);
+        else if (!TryInterpolate(time, out pos, out rotY)) Extrapolate(_samples[^1], time, out pos, out rotY);
         return true;
     }
 
-    private static V3 P(PlayerStateMsg m) => new(m.PosX, m.PosY, m.PosZ);
-
-    public static float LerpAngle(float a, float b, float t)
+    public static float LerpAngle(float from, float to, float t)
     {
-        float d = ((b - a) % 360f + 540f) % 360f - 180f;
-        return a + d * t;
+        float shortestTurn = ((to - from) % FullTurnDegrees + FullTurnDegrees + HalfTurnDegrees) % FullTurnDegrees - HalfTurnDegrees;
+        return from + shortestTurn * t;
     }
+
+    private double SenderTimeAt(double localNow) => localNow - _clockOffset - Delay;
+
+    private bool IsOldOrDuplicate(PlayerStateMsg sample)
+    {
+        if (Latest == null) return false;
+        bool notNewer = sample.Seq <= Latest.Seq;
+        bool wrappedAround = Latest.Seq - sample.Seq >= uint.MaxValue / 2;
+        return notNewer && !wrappedAround;
+    }
+
+    /// <summary>The smallest offset seen is the best estimate; it drifts up slowly for clock drift and route changes.</summary>
+    private void TrackClockOffset(double offset)
+    {
+        if (double.IsNaN(_clockOffset) || offset < _clockOffset) _clockOffset = offset;
+        else _clockOffset += (offset - _clockOffset) * OffsetDriftRate;
+    }
+
+    private bool TryInterpolate(double time, out V3 pos, out float rotY)
+    {
+        for (int i = _samples.Count - 1; i > 0; i--)
+        {
+            var earlier = _samples[i - 1];
+            var later = _samples[i];
+            if (time < earlier.SenderTime || time > later.SenderTime) continue;
+            double span = later.SenderTime - earlier.SenderTime;
+            float blend = span <= MinimumSampleSpan ? 1f : (float)((time - earlier.SenderTime) / span);
+            pos = V3.Lerp(PositionOf(earlier), PositionOf(later), blend);
+            rotY = LerpAngle(earlier.RotY, later.RotY, blend);
+            return true;
+        }
+        pos = default;
+        rotY = 0;
+        return false;
+    }
+
+    private void Extrapolate(PlayerStateMsg last, double time, out V3 pos, out float rotY)
+    {
+        float seconds = (float)Math.Min(time - last.SenderTime, MaxExtrapolation);
+        pos = new V3(
+            last.PosX + last.VelX * seconds,
+            last.PosY + last.VelY * seconds,
+            last.PosZ + last.VelZ * seconds);
+        rotY = last.RotY;
+    }
+
+    private static void HoldPose(PlayerStateMsg sample, out V3 pos, out float rotY)
+    {
+        pos = PositionOf(sample);
+        rotY = sample.RotY;
+    }
+
+    private static V3 PositionOf(PlayerStateMsg sample) => new(sample.PosX, sample.PosY, sample.PosZ);
 }

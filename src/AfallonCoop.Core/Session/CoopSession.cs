@@ -31,15 +31,12 @@ public sealed class CoopSession : IDisposable
     private readonly LeaseView _leaseView = new();
     private readonly HashSet<uint> _interest = new();
     private readonly Dictionary<uint, bool> _leaseCombat = new();
-    private readonly Dictionary<byte, Place> _lastPlaceByPlayer = new();
-    private readonly Dictionary<string, Place> _placeByPlayerKey = new();
+    private readonly ReturnPlaces _returnPlaces = new();
     private readonly Dictionary<MsgType, HostHandler> _hostHandlers;
     private readonly Dictionary<MsgType, ClientHandler> _clientHandlers;
 
     private bool _localMenuOpen;
     private int _reportedBots = BotCountUnknown;
-
-    private readonly record struct Place(int Scene, float X, float Y, float Z);
 
     public bool IsHost { get; }
     public byte LocalId { get; private set; }
@@ -509,16 +506,8 @@ public sealed class CoopSession : IDisposable
     private void SendReturnPlace(byte player)
     {
         if (!Players.TryGetValue(player, out var info)) return;
-        if (!_placeByPlayerKey.TryGetValue(_playerKeys.Of(info), out var place)) return;
-        SendGroupMessage(player, GroupOp.ReturnTo, w => WritePlace(w, place), () => { });
-    }
-
-    private static void WritePlace(NetWriter writer, Place place)
-    {
-        writer.I32(place.Scene);
-        writer.F32(place.X);
-        writer.F32(place.Y);
-        writer.F32(place.Z);
+        if (!_returnPlaces.TryGet(_playerKeys.Of(info), out var place)) return;
+        SendGroupMessage(player, GroupOp.ReturnTo, place.Write, () => { });
     }
 
     private void OnGroupsDecided()
@@ -536,23 +525,7 @@ public sealed class CoopSession : IDisposable
     {
         var writer = _outbox.Begin(MsgType.Group);
         writer.U8((byte)GroupOp.State);
-        var groups = _groupRegistry.All;
-        writer.U8((byte)groups.Count);
-        foreach (var group in groups) WriteGroup(writer, group);
-    }
-
-    private static void WriteGroup(NetWriter writer, GroupRegistry.Group group)
-    {
-        writer.U8(group.Id);
-        writer.Str(group.LeaderKey);
-        writer.U8((byte)group.Members.Count);
-        foreach (var member in group.Members)
-        {
-            writer.Str(member.Key);
-            writer.Str(member.Name);
-            writer.U8(member.Id);
-            writer.U8((byte)Math.Clamp(member.Bots, 0, byte.MaxValue));
-        }
+        GroupDirectory.Write(writer, _groupRegistry.All);
     }
 
     private void OnClientGroupOp(MsgType type, ref NetReader reader)
@@ -620,7 +593,7 @@ public sealed class CoopSession : IDisposable
         if (!Players.Remove(id, out var info)) return;
         _pause.Forget(id);
         _leases.PlayerLeft(id, _clock());
-        if (_lastPlaceByPlayer.Remove(id, out var place)) _placeByPlayerKey[_playerKeys.Of(info)] = place;
+        _returnPlaces.SaveForReturn(id, _playerKeys.Of(info));
         _groupRegistry.PlayerOffline(id);
         _playerKeys.Release(id);
         _outbox.Begin(MsgType.PlayerLeft).U8(id);
@@ -697,7 +670,7 @@ public sealed class CoopSession : IDisposable
     {
         var state = PlayerStateMsg.Read(ref reader);
         state.Id = sender;
-        if (state.InWorld) _lastPlaceByPlayer[sender] = new Place(state.SceneHash, state.PosX, state.PosY, state.PosZ);
+        _returnPlaces.Observe(sender, state);
         state.Write(_outbox.BeginUntyped());
         _outbox.ToEveryone(Delivery.Unreliable, exceptConnection: connection);
         StateReceived?.Invoke(state);

@@ -10,6 +10,12 @@ public static class SteamPlatform
 {
     public const string LobbyTag = "afcoop";
 
+    private const string LobbyFlag = "1";
+    private const string JoinCommandPrefix = "+afcoop_lobby ";
+    private const string HostKey = "host";
+    private const string NameKey = "name";
+    private const string VersionKey = "ver";
+
     public static bool Initialized { get; private set; }
     public static string InitError { get; private set; } = "";
     public static uint AppId { get; private set; }
@@ -44,16 +50,7 @@ public static class SteamPlatform
             }
             Initialized = true;
             AppId = SteamUtils.GetAppID().m_AppId;
-            _lobbyJoinReq = Callback<GameLobbyJoinRequested_t>.Create(cb => JoinLobby(cb.m_steamIDLobby));
-            _rpJoinReq = Callback<GameRichPresenceJoinRequested_t>.Create(cb =>
-            {
-                var s = cb.m_rgchConnect ?? "";
-                const string prefix = "+afcoop_lobby ";
-                if (s.StartsWith(prefix) && ulong.TryParse(s.Substring(prefix.Length).Trim(), out var id))
-                    JoinLobby(new CSteamID(id));
-            });
-            _lobbyEnter = Callback<LobbyEnter_t>.Create(OnLobbyEnter);
-            _lobbyCreated = CallResult<LobbyCreated_t>.Create(OnLobbyCreated);
+            RegisterCallbacks();
             Log?.Invoke($"Steam ready: {SteamFriends.GetPersonaName()} ({SteamUser.GetSteamID().m_SteamID}), appid {AppId}");
             return true;
         }
@@ -62,6 +59,22 @@ public static class SteamPlatform
             InitError = e.GetType().Name + ": " + e.Message;
             return false;
         }
+    }
+
+    private static void RegisterCallbacks()
+    {
+        _lobbyJoinReq = Callback<GameLobbyJoinRequested_t>.Create(request => JoinLobby(request.m_steamIDLobby));
+        _rpJoinReq = Callback<GameRichPresenceJoinRequested_t>.Create(OnRichPresenceJoinRequested);
+        _lobbyEnter = Callback<LobbyEnter_t>.Create(OnLobbyEnter);
+        _lobbyCreated = CallResult<LobbyCreated_t>.Create(OnLobbyCreated);
+    }
+
+    private static void OnRichPresenceJoinRequested(GameRichPresenceJoinRequested_t request)
+    {
+        string command = request.m_rgchConnect ?? "";
+        if (!command.StartsWith(JoinCommandPrefix)) return;
+        if (ulong.TryParse(command.Substring(JoinCommandPrefix.Length).Trim(), out var lobbyId))
+            JoinLobby(new CSteamID(lobbyId));
     }
 
     public static void RunCallbacks()
@@ -80,25 +93,25 @@ public static class SteamPlatform
     public static ulong MySteamId => Initialized ? SteamUser.GetSteamID().m_SteamID : 0;
     public static string MyName => Initialized ? SteamFriends.GetPersonaName() : Environment.UserName;
 
-    // ---------- hosting ----------
-
     public static void CreateLobby(string hostName, string modVersion, Action<bool, string> done)
     {
-        _createDone = (ok, info) =>
+        _createDone = (created, info) =>
         {
-            if (ok)
-            {
-                SteamMatchmaking.SetLobbyData(CurrentLobby, LobbyTag, "1");
-                SteamMatchmaking.SetLobbyData(CurrentLobby, "host", MySteamId.ToString());
-                SteamMatchmaking.SetLobbyData(CurrentLobby, "name", hostName);
-                SteamMatchmaking.SetLobbyData(CurrentLobby, "ver", modVersion);
-                SteamFriends.SetRichPresence("status", "Afallon Co-op");
-                SteamFriends.SetRichPresence("connect", "+afcoop_lobby " + CurrentLobby.m_SteamID);
-            }
-            done(ok, info);
+            if (created) PublishLobby(hostName, modVersion);
+            done(created, info);
         };
         var call = SteamMatchmaking.CreateLobby(ELobbyType.k_ELobbyTypeFriendsOnly, Protocol.ProtocolInfo.MaxPlayers);
         _lobbyCreated.Set(call);
+    }
+
+    private static void PublishLobby(string hostName, string modVersion)
+    {
+        SteamMatchmaking.SetLobbyData(CurrentLobby, LobbyTag, LobbyFlag);
+        SteamMatchmaking.SetLobbyData(CurrentLobby, HostKey, MySteamId.ToString());
+        SteamMatchmaking.SetLobbyData(CurrentLobby, NameKey, hostName);
+        SteamMatchmaking.SetLobbyData(CurrentLobby, VersionKey, modVersion);
+        SteamFriends.SetRichPresence("status", "Afallon Co-op");
+        SteamFriends.SetRichPresence("connect", JoinCommandPrefix + CurrentLobby.m_SteamID);
     }
 
     private static void OnLobbyCreated(LobbyCreated_t cb, bool ioFailure)
@@ -120,8 +133,6 @@ public static class SteamPlatform
         SteamFriends.ClearRichPresence();
     }
 
-    // ---------- joining ----------
-
     public static void JoinLobby(CSteamID lobby)
     {
         if (!Initialized) return;
@@ -139,16 +150,17 @@ public static class SteamPlatform
         }
         CurrentLobby = lobby;
         var owner = SteamMatchmaking.GetLobbyOwner(lobby);
-        if (owner == SteamUser.GetSteamID()) return; // our own lobby (host side)
-        if (SteamMatchmaking.GetLobbyData(lobby, LobbyTag) != "1")
+        bool isOwnLobby = owner == SteamUser.GetSteamID();
+        if (isOwnLobby) return;
+        if (SteamMatchmaking.GetLobbyData(lobby, LobbyTag) != LobbyFlag)
         {
             Log?.Invoke("That lobby is not an Afallon Co-op lobby.");
             SteamMatchmaking.LeaveLobby(lobby);
             CurrentLobby = CSteamID.Nil;
             return;
         }
-        var hostStr = SteamMatchmaking.GetLobbyData(lobby, "host");
-        var host = ulong.TryParse(hostStr, out var h) ? new CSteamID(h) : owner;
+        var hostId = SteamMatchmaking.GetLobbyData(lobby, HostKey);
+        var host = ulong.TryParse(hostId, out var parsed) ? new CSteamID(parsed) : owner;
         JoinHostRequested?.Invoke(host);
     }
 

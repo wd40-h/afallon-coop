@@ -1,4 +1,4 @@
-# AfNotAllon: online co-op for Afallon
+# Online co-op for Afallon
 
 A BepInEx mod that turns Afallon into an online co-op game for up to 5 players, counting players and their bots
 together. The host's world is shared: everyone sees the same mobs, bosses, weather, time of day, world events and
