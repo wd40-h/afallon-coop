@@ -132,7 +132,14 @@ The mod's code is under the [MIT license](LICENSE). BepInEx, LiteNetLib and Stea
 ## Changelog
 - **0.7.0:**
   - Renamed the mod to AfallonCoop, including the release archive name (`AfallonCoop-<version>.zip`) and the in-game
-    title. Every player must update to the same version.
+    title. Everyone needs the same version to play together.
+  - Fixes: the last reliable messages of a player who disconnects over Steam are no longer lost; group loot rolls are
+    cleared when someone leaves and stale kills are pruned; a trade answer from someone not in the trade is ignored
+    and the host refunds a trade nobody answers after 20 s; the damage meter handles an over-long remote encounter.
+  - Less work per frame: inspect and the damage meter no longer scan the scene every frame, player visuals and packet
+    handling allocate less, and the network core ticks without LINQ.
+  - Internal cleanup, with no behaviour or protocol change: the network session is split into smaller parts (outbox,
+    peers, pause, spawner leases, groups) and the transports and registries were tidied up.
 - **0.6.0:**
   - Fixes: no more lost items or gold when the host is on a loading screen; trades that freeze when someone
     disconnects give the items back; a loot roll won by a player who left reaches them by mail; auction mail is no
