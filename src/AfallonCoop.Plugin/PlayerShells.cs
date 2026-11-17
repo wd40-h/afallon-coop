@@ -104,7 +104,7 @@ internal static class PlayerShells
         return m;
     }
 
-    private static readonly Dictionary<byte, string> AppliedSig = new();
+    private static readonly Dictionary<byte, (string name, int level, int cls)> AppliedInfo = new();
 
     // ---- a hit shown before its player's machine has applied it (client-side prediction) ----
     //
@@ -137,9 +137,9 @@ internal static class PlayerShells
         var vitals = Puppets.Vitals(id);
         var s = CoopManager.Session;
         var info = s != null && s.Players.TryGetValue(id, out var p) ? p : null;
-        string sig = info == null ? "" : $"{info.CharacterName}|{info.Level}|{info.ClassId}";
-        bool infoChanged = !AppliedSig.TryGetValue(id, out var was) || was != sig;
-        AppliedSig[id] = sig;
+        var infoKey = info == null ? default : (info.CharacterName, info.Level, info.ClassId);
+        bool infoChanged = !AppliedInfo.TryGetValue(id, out var was) || was != infoKey;
+        AppliedInfo[id] = infoKey;
         try
         {
             if (info != null && infoChanged)
@@ -188,7 +188,7 @@ internal static class PlayerShells
 
     private static void Remove(byte id)
     {
-        AppliedSig.Remove(id);
+        AppliedInfo.Remove(id);
         PredictedAt.Remove(id);
         foreach (var k in new List<(byte, int)>(SetMax.Keys)) if (k.Item1 == id) SetMax.Remove(k);
         if (ByPlayer.Remove(id, out var s) && s != null && !s.WasCollected)

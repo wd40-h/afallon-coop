@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using AfallonCoop.World;
 using BLINK.RPGBuilder.Dungeons;
 using BLINK.RPGBuilder.LogicMono;
 using BLINK.RPGBuilder.Managers;
@@ -20,6 +21,7 @@ internal static class Dungeons
 {
     private static string _scene = "";
     private static string _instance = "";
+    private static string _place = ""; // the composed key: built once per place, not on every read (it is read every frame)
     private static HashSet<int> _dungeonIds;
 
     /// <summary>Where the local player is, for the mod: the scene, plus the instance in a dungeon.</summary>
@@ -33,7 +35,7 @@ internal static class Dungeons
                 if (!GameInfo.InWorld) return scene; // loading: the group may not be known yet, decide once in the world
                 Enter(scene);
             }
-            return _instance.Length == 0 ? scene : scene + "#" + _instance;
+            return _place;
         }
     }
 
@@ -43,8 +45,14 @@ internal static class Dungeons
     {
         _scene = scene;
         var match = Battlegrounds.InstanceFor(scene); // a battleground's scene: the match's own
-        if (match != null) { _instance = match; Plugin.L.LogInfo($"Battleground '{scene}': instance {_instance}"); return; }
+        if (match != null)
+        {
+            _instance = match; _place = PlaceName.Of(scene, _instance);
+            Plugin.L.LogInfo($"Battleground '{scene}': instance {_instance}");
+            return;
+        }
         _instance = IsDungeonScene(scene) ? InstanceForMe() : "";
+        _place = PlaceName.Of(scene, _instance);
         if (_instance.Length > 0 && _outsideScene.Length > 0) SaveEntrance(scene, _outsideScene, _outsidePos);
         if (_instance.Length > 0) Plugin.L.LogInfo($"Dungeon '{scene}': instance {_instance}");
     }
@@ -274,7 +282,7 @@ internal static class Dungeons
     }
 
     /// <summary>Forget the latched instance (session change): the next <see cref="Place"/> decides again.</summary>
-    public static void Reset() { _scene = ""; _instance = ""; }
+    public static void Reset() { _scene = ""; _instance = ""; _place = ""; }
 
     /// <summary>Dev: the dungeons the finder knows (id, scene name, levels), and where we are.</summary>
     public static string DevList()

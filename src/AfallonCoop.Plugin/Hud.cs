@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using System.Linq;
 using AfallonCoop.Session;
 using TMPro;
 using UnityEngine;
@@ -18,6 +17,11 @@ internal static class Hud
     private static string _lastStatus = "";
     private static TextMeshProUGUI _pause;
     private static readonly Dictionary<byte, (float until, string text)> Bubbles = new();
+    // Reused per frame: the HUD runs every frame and must not hand the GC a closure, an iterator and two collections each time.
+    private static readonly System.Text.StringBuilder FeedText = new();
+    private static string _lastFeed = "";
+    private static readonly HashSet<byte> SeenPlayers = new();
+    private static readonly List<Sprite> StateSprites = new();
 
     /// <summary>Show a chat line over a player's head for a few seconds.</summary>
     public static void Bubble(byte id, string text)
@@ -100,8 +104,21 @@ internal static class Hud
         if (_pause.text != pauseText) _pause.text = pauseText;
 
         float now = Time.unscaledTime;
-        Feed.RemoveAll(f => f.until < now);
-        _feed.text = string.Join("\n", Feed.Select(f => f.text));
+        if (Feed.Count > 0)
+        {
+            int to = 0;
+            for (int i = 0; i < Feed.Count; i++) if (Feed[i].until >= now) Feed[to++] = Feed[i];
+            if (to < Feed.Count) Feed.RemoveRange(to, Feed.Count - to);
+            FeedText.Clear();
+            foreach (var f in Feed)
+            {
+                if (FeedText.Length > 0) FeedText.Append('\n');
+                FeedText.Append(f.text);
+            }
+            string text = FeedText.ToString();
+            if (text != _lastFeed) { _lastFeed = text; _feed.text = text; }
+        }
+        else if (_lastFeed.Length > 0) { _lastFeed = ""; _feed.text = ""; }
     }
 
     private static float _nameplateDistance = 40f;
@@ -130,7 +147,7 @@ internal static class Hud
     {
         if (_root == null || !_root.activeSelf) return;
         var cam = Camera.main;
-        var seen = new HashSet<byte>();
+        var seen = SeenPlayers; seen.Clear();
         var s = CoopManager.Session;
         if (cam != null && s != null)
         {
@@ -190,7 +207,7 @@ internal static class Hud
                 icons.Add(img);
             }
         }
-        var sprites = new List<Sprite>();
+        var sprites = StateSprites; sprites.Clear();
         var shell = PlayerShells.Get(id);
         var states = shell != null ? shell.GetStates() : null;
         if (states != null)

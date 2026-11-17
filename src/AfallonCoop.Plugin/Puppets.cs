@@ -165,7 +165,14 @@ internal static class Puppets
     private static void Destroy(Puppet p)
     {
         if (p.Go != null) PlayerActions.BeforeDestroy(p.Go);
-        if (p.Go != null) { MaterialSnapshot.Forget(p.Go.transform); Translucency.Forget(p.Go); Object.Destroy(p.Go); }
+        if (p.Go != null)
+        {
+            // Its shape and mount are keyed by this object's address: tell those caches before the object goes, or the
+            // next object to get that address is taken for this one (and the entries stay for the session).
+            FormVisual.Clear(p.Go); MountVisual.Clear(p.Go);
+            MaterialSnapshot.Forget(p.Go.transform); Translucency.Forget(p.Go); Object.Destroy(p.Go);
+        }
+        FxSync.RemoveHandAura(p.Id); // a cast whose stop never came would keep its glow keyed by this player
         p.Go = null; p.Anim = null; p.Appearance = null; p.Visible = false; p.VisualSig = null; p.Armed = null; p.ControllerHash = 0;
     }
 
@@ -174,8 +181,14 @@ internal static class Puppets
         var scene = Dungeons.Place;
         if (scene != _scene)
         {
-            // Scene objects are destroyed with the scene; forget our references.
-            foreach (var p in All.Values) { p.Go = null; p.Anim = null; p.Appearance = null; p.Visible = false; p.VisualSig = null; }
+            // Scene objects are destroyed with the scene; forget our references. The form/mount/cast-glow caches are
+            // keyed by object addresses and are not scene-aware either: they go now, before the next scene reuses them.
+            foreach (var p in All.Values)
+            {
+                if (p.Go != null) { FormVisual.Clear(p.Go); MountVisual.Clear(p.Go); }
+                FxSync.RemoveHandAura(p.Id);
+                p.Go = null; p.Anim = null; p.Appearance = null; p.Visible = false; p.VisualSig = null; p.Armed = null; p.ControllerHash = 0;
+            }
             _holder = null;
             _scene = scene;
             _sceneHash = StableHash.Of(scene);

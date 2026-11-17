@@ -268,7 +268,7 @@ internal static class GroupLoot
             if (m.Entry != null) CloseSlot(m);
             ItemData.DropTemps("roll" + m.Id);
         }
-        Open.Clear(); Rolls.Clear(); SeenMobs.Clear();
+        Open.Clear(); Rolls.Clear(); SeenMobs.Clear(); Masks.Clear(); // group ids start at 1 again: the old rules must not apply
     }
 
     /// <summary>The game's rule: a need beats a greed, then the highest roll (the first of equals); no one: gone.</summary>

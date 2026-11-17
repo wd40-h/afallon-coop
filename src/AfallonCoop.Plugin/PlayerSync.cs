@@ -18,10 +18,16 @@ internal static class PlayerSync
     private static bool _wasInWorld;
     private static string _infoSignature = "";
 
+    // The last look gathered for others (see SendInfoIfChanged): reused between captures, replaced when the key changes.
+    private static PlayerInfo _visuals;
+    private static long _visualKey;
+    private static float _visualAt = -100f;
+    private const float VisualRefresh = 5f;
 
     public static void Reset()
     {
         _seq = 0; _nextSend = 0; _nextInfo = 0; _infoSignature = ""; _wasInWorld = false; Delta.Reset(); _lastController = 0;
+        _visuals = null; _visualKey = 0; _visualAt = -100f;
     }
 
     public static void Update(CoopSession s, double now)
@@ -125,13 +131,29 @@ internal static class PlayerSync
         string gender = inWorld && cd != null ? cd.Gender : "";
         int level = inWorld && cd != null ? cd.Level : 0;
         string scene = inWorld ? Dungeons.Place : "";
-        var visuals = new PlayerInfo();
-        if (inWorld) GameInfo.FillVisuals(visuals);
-        visuals.RaceId = race; visuals.Gender = gender ?? "";
+        // Gathering the look (appearance serialize, gear scan, material snapshot, ability list) is the most expensive part
+        // of this tick and almost never changes: do it when the gear changed, or every few seconds for the rest
+        // (hair and the like), not on every 1 Hz info tick. What it says still goes out as soon as it differs.
+        if (!inWorld) { _visuals = null; _visualKey = 0; _visualAt = -100f; }
+        else
+        {
+            long key = VisualKey();
+            if (_visuals == null || key != _visualKey || Time.unscaledTime - _visualAt >= VisualRefresh)
+            {
+                var captured = new PlayerInfo();
+                GameInfo.FillVisuals(captured);
+                captured.RaceId = race; captured.Gender = gender ?? "";
+                _visuals = captured; _visualKey = key; _visualAt = Time.unscaledTime;
+            }
+        }
+        var visuals = _visuals;
+        string vSig = visuals != null ? visuals.VisualSignature : "";
+        string vMats = visuals != null ? visuals.Materials : "";
+        int vCount = visuals != null ? visuals.FxPrewarm.Count : 0;
         byte role = 0;
         // the role chosen in the Dungeon Finder window (DungeonFinderService.Role answers by class, SelectedRole only once queued)
         try { if (inWorld) role = (byte)BLINK.RPGBuilder.Dungeons.DungeonFinderService.Instance.Data.PreferredRole; } catch { } // what the finder window saves (SavePreferredRole)
-        string sig = $"{charName}|{cls}|{level}|{role}|{scene}|{visuals.VisualSignature}|{visuals.Materials}|{visuals.FxPrewarm.Count}";
+        string sig = $"{charName}|{cls}|{level}|{role}|{scene}|{vSig}|{vMats}|{vCount}";
         if (sig == _infoSignature) return;
         _infoSignature = sig;
         Prof.Count("info.sent");
@@ -139,8 +161,35 @@ internal static class PlayerSync
         {
             p.Role = role;
             p.CharacterName = charName; p.ClassId = cls; p.RaceId = race; p.Gender = gender ?? ""; p.Level = level; p.Scene = scene;
-            p.Appearance = visuals.Appearance; p.Armor = visuals.Armor; p.Weapons = visuals.Weapons; p.Materials = visuals.Materials;
-            p.FxPrewarm = visuals.FxPrewarm;
+            p.Appearance = visuals != null ? visuals.Appearance : "";
+            p.Materials = visuals != null ? visuals.Materials : "";
+            p.Armor = visuals != null ? visuals.Armor : new List<int>();
+            p.Weapons = visuals != null ? visuals.Weapons : new List<int>();
+            p.FxPrewarm = visuals != null ? visuals.FxPrewarm : new List<int>();
         });
+    }
+
+    /// <summary>What the look is built from that changes in play: the equipped pieces, and whether a helm or cape shows.</summary>
+    private static long VisualKey()
+    {
+        var cd = GameInfo.Character;
+        var p = GameInfo.Player;
+        if (cd == null || p == null) return 0;
+        long hash = 17;
+        try
+        {
+            var items = GameDatabase.Instance.GetItems();
+            if (cd.ArmorPiecesEquipped != null)
+                foreach (var a in cd.ArmorPiecesEquipped)
+                {
+                    hash = hash * 31 + (a != null ? a.itemID : 0);
+                    bool shown = a != null && a.itemID > 0 && !GameInfo.HiddenByChoice(p, items.ContainsKey(a.itemID) ? items[a.itemID] : null);
+                    hash = hash * 31 + (shown ? 1 : 0);
+                }
+            if (cd.WeaponsEquipped != null)
+                foreach (var w in cd.WeaponsEquipped) hash = hash * 31 + (w != null ? w.itemID : 0);
+        }
+        catch { }
+        return hash;
     }
 }

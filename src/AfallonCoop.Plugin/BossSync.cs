@@ -99,6 +99,9 @@ internal static class BossSync
     /// <summary>Copies' casts as their owners cast them, for the cast bars (the game reads them off the entity).</summary>
     private static readonly Dictionary<IntPtr, (RPGAbility ability, float start, float duration)> Casting = new();
 
+    /// <summary>A copy is gone (despawned, another scene): nothing stays keyed by its address, which the next entity may get.</summary>
+    public static void Forget(IntPtr ptr) => Casting.Remove(ptr);
+
     // ---------------- spatial abilities: each player's game ----------------
 
     private static bool _mirroring;

@@ -463,7 +463,7 @@ internal static class AuctionSync
     {
         var m = Market;
         if (m != null && _own != null) try { m.State.Listings = _own; m.Revision = m.Revision + 1; } catch { }
-        _own = null; _mirror = null; _hostClockAt = -1f; Names.Clear(); Owners.Clear(); _ownersFor = null; _sentRevision = int.MinValue; _browsing = false; Browsing.Clear();
+        _own = null; _mirror = null; _hostClockAt = -1f; Names.Clear(); Owners.Clear(); _ownersFor = null; _sentRevision = int.MinValue; _browsing = false; Browsing.Clear(); SentAt.Clear();
     }
 
     private static bool _saving;

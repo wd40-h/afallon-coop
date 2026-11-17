@@ -115,7 +115,7 @@ internal static class GameInfo
     /// A helmet or cape the player chose not to show (the game's "show helm/cloak" settings): others do not see it
     /// either. Asked of the game itself (is that piece's visual shown now), for those two slots only.
     /// </summary>
-    private static bool HiddenByChoice(PlayerCombatEntity p, RPGItem item)
+    internal static bool HiddenByChoice(PlayerCombatEntity p, RPGItem item)
     {
         if (item == null || p?.appearance == null) return false;
         try

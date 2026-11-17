@@ -158,6 +158,9 @@ internal static class BossPhases
     private static readonly Dictionary<IntPtr, (RPGAbility ability, float start, float duration)> Channeling = new();
     private static bool _applyingChannel;
 
+    /// <summary>A copy is gone: its channelling cannot end by a stop that will never come.</summary>
+    public static void Forget(IntPtr ptr) => Channeling.Remove(ptr);
+
     private static void SendChannel(CombatEntity e, RPGAbility ability, RPGAbility.RPGAbilityRankData rank, float duration, bool start)
     {
         if (_applyingChannel || !Connected || !MobSync.TryGetOwnedNetId(e, out var netId)) return;

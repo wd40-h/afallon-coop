@@ -917,6 +917,7 @@ internal static class ItemData
         }
         catch (Exception e) { Plugin.L.LogWarning("Item data drop: " + e.Message); }
         list.Clear();
+        Temps.Remove(owner); // the key is per display ("roll<id>"): keeping it grows the map for the whole session
     }
 
     public static string Describe(int dataId)

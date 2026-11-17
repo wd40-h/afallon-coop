@@ -50,6 +50,17 @@ internal static class GroupFinder
 
     public static void Install(Harmony h) => h.PatchAll(typeof(Patches));
 
+    /// <summary>Session over: nothing about its dungeon, its bots or its ready check stays for the next one.</summary>
+    public static void Reset()
+    {
+        RolesOf.Clear(); Ready.Clear(); HeldFrom.Clear(); HereSince.Clear();
+        _roster.Clear(); _rosterSig = ""; _shownRoster = null;
+        _sentRoles = ""; _nextRoles = 0f; _receivedAt = -100f;
+        _invitedDungeon = 0; _leaderReady = false; _lastPhase = default;
+        _memberInvite = false; _going = false; _cancelling = false; _planning = false;
+        Engage.Clear(); Returning.Clear();
+    }
+
     private static AfallonCoop.Session.GroupInfo Group => CoopManager.Connected ? CoopManager.Session?.MyGroup : null;
     private static bool IAmLeader => Group != null && Group.Leader == CoopManager.Session.LocalId;
     private static bool HasOthers

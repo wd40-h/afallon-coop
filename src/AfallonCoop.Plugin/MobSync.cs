@@ -117,6 +117,9 @@ internal static class MobSync
     private static readonly NetWriter W = new();
     private static readonly List<AnimParam> TmpParams = new();
     private static readonly List<AnimLayer> TmpLayers = new();
+    // Scratch for an incoming state packet: reused for every mob in it (the values are copied into the copy's own lists).
+    private static readonly List<AnimParam> RecvParams = new();
+    private static readonly List<AnimLayer> RecvLayers = new();
 
     private static uint NewNetId() => ((uint)S.LocalId << 24) | (++_nextNetId & 0xFFFFFF);
 
@@ -193,6 +196,7 @@ internal static class MobSync
     /// <summary>Report interest, pick up newly spawned mobs of owned spawners, report gone ones and combat.</summary>
     private static void Scan()
     {
+        if (SuppressedPets.Count > 0) PruneSuppressed(); // a handover window that passed is not kept
         var s = S;
         foreach (var kv in Spawners)
         {
@@ -237,7 +241,7 @@ internal static class MobSync
 
         // A spawner takes its copies with it when it deactivates here; a zone's copies are not in its list (the game
         // would save them into this machine's bot world), so they go here.
-        List<Copy> away = null;
+        HashSet<Copy> away = null;
         foreach (var c in Copies.Values)
         {
             if (Zones.TryGetValue(c.Spawner, out var z)) { if (z == null || !z.IsActive) (away ??= new()).Add(c); } // bots and their pets
@@ -774,10 +778,10 @@ internal static class MobSync
             float hp = r.F32(), maxHp = r.F32();
             int level = r.U8();
             float x = r.F32(), y = r.F32(), z = r.F32(), rotY = r.F32();
-            var ps = new List<AnimParam>();
+            var ps = RecvParams; ps.Clear();
             int pc = r.U8();
             for (int k = 0; k < pc; k++) ps.Add(new AnimParam(r.I32(), (AnimParamType)r.U8(), r.F32()));
-            var ls = new List<AnimLayer>();
+            var ls = RecvLayers; ls.Clear();
             int lc = r.U8();
             for (int k = 0; k < lc; k++) ls.Add(new AnimLayer(r.I32(), r.F32(), r.F32()));
             bool gear = (flags & 8) != 0;
@@ -803,7 +807,11 @@ internal static class MobSync
             c.Owner = from;
             c.HeardAt = Time.unscaledTime;
             c.Motion.Add(new PlayerStateMsg { Seq = seq, SenderTime = senderTime, PosX = x, PosY = y, PosZ = z, RotY = rotY, InWorld = true }, now);
-            c.Params.Apply(ps, (flags & 4) != 0); c.Layers = ls;
+            c.Params.Apply(ps, (flags & 4) != 0);
+            var layers = c.Layers;
+            if (layers == null) c.Layers = layers = new List<AnimLayer>();
+            else layers.Clear();
+            layers.AddRange(ls); // into the copy's own list: a state update must not hand the GC a list per mob per packet
             c.Dead = (flags & 1) != 0;
             if (!c.Dead && c.DeathPlayed && hp > 0f) Revive(c, hp, maxHp); // alive again on its owner (resurrected, respawned)
             ApplyHealthAndLevel(c, hp, maxHp, level);
@@ -899,6 +907,7 @@ internal static class MobSync
     {
         if (CopyPtrs.TryGetValue(c.Ptr, out var id) && id == c.NetId) CopyPtrs.Remove(c.Ptr);
         Participants.Remove(c.Ptr); ResurrectOffered.Remove(c.Ptr);
+        BossSync.Forget(c.Ptr); BossPhases.Forget(c.Ptr); FxSync.RemoveHandAura(c.Ptr.ToInt64()); // anything keyed by its address
     }
 
     public static void LateUpdate(double now)
@@ -1290,6 +1299,16 @@ internal static class MobSync
 
     /// <summary>(player, NPC id) whose pet copy must not come back for a while: that bot was handed over to this machine.</summary>
     private static readonly Dictionary<(byte, int), float> SuppressedPets = new();
+    private static readonly List<(byte, int)> SuppressedGone = new(); // reused when pruning
+
+    /// <summary>Handovers whose window passed: from then on that pet is taken from its owner again.</summary>
+    private static void PruneSuppressed()
+    {
+        float now = Time.unscaledTime;
+        SuppressedGone.Clear();
+        foreach (var kv in SuppressedPets) if (kv.Value <= now) SuppressedGone.Add(kv.Key);
+        foreach (var key in SuppressedGone) SuppressedPets.Remove(key);
+    }
 
     /// <summary>
     /// A bot companion of that player now runs here (handed over): its copy goes at once, and the player's last few

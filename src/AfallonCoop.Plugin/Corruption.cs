@@ -210,6 +210,7 @@ internal static class Corruption
     // ---------------- Infested: the mob machine's roll and pulses ----------------
 
     private static readonly Dictionary<uint, bool> SentInfested = new();
+    private static readonly List<uint> StaleInfested = new(); // reused when pruning
     private static float _nextInfestedResend;
     private static bool _pulsing;
 
@@ -228,10 +229,19 @@ internal static class Corruption
         }
     }
 
+    /// <summary>Mobs this machine no longer runs: their roll is not remembered for the rest of the session.</summary>
+    private static void PruneSent()
+    {
+        if (SentInfested.Count == 0) return;
+        StaleInfested.Clear();
+        foreach (var id in SentInfested.Keys) if (MobSync.GetOwned(id) == null) StaleInfested.Add(id);
+        foreach (var id in StaleInfested) SentInfested.Remove(id);
+    }
+
     private static void AfterSlowTick()
     {
         bool resend = Time.unscaledTime >= _nextInfestedResend;
-        if (resend) _nextInfestedResend = Time.unscaledTime + 5f;
+        if (resend) { _nextInfestedResend = Time.unscaledTime + 5f; PruneSent(); }
         foreach (var e in MobSync.AllSynced())
         {
             if (e == null || MobSync.IsCopy(e) || !MobSync.TryGetOwnedNetId(e, out var id)) continue;

@@ -308,10 +308,7 @@ internal static class FxSync
     /// <summary>Same rules as the game's CastingHandAuras (cast longer than 0.05 s, human rig, both hands), on a puppet or a bot's copy.</summary>
     private static void PlayHand(long id, Kind kind, ref NetReader r, Animator anim)
     {
-        if (HandAuras.TryGetValue(id, out var old))
-        {
-            if (kind != Kind.HandInstant) { foreach (var g in old) if (g != null) Object.Destroy(g); HandAuras.Remove(id); }
-        }
+        if (kind != Kind.HandInstant) RemoveHandAura(id); // a new cast or its end: the previous glow goes
         if (kind == Kind.HandCastStop) { Played++; return; }
         int abilityId = r.I32(), rankIndex = r.I32();
         float castDuration = r.F32();
@@ -339,6 +336,27 @@ internal static class FxSync
             HandAuras[id] = list;
         }
         Played++;
+    }
+
+    /// <summary>
+    /// The cast stopped, or the player/copy it belonged to is gone: its hand glow goes and nothing stays keyed by it.
+    /// A stop that never arrived (a lost packet, a disconnect, a scene change) would otherwise keep the auras forever.
+    /// </summary>
+    public static void RemoveHandAura(long id)
+    {
+        if (!HandAuras.TryGetValue(id, out var auras)) return;
+        HandAuras.Remove(id);
+        foreach (var g in auras) if (g != null) Object.Destroy(g);
+    }
+
+    /// <summary>Session over: queued and held casting visuals go with it.</summary>
+    public static void Reset()
+    {
+        foreach (var auras in HandAuras.Values)
+            foreach (var g in auras) if (g != null) Object.Destroy(g);
+        HandAuras.Clear();
+        Queue.Clear();
+        _hands = null;
     }
 
     private static void Play(byte id, byte[] data)

@@ -130,6 +130,12 @@ Runs the tests of the network core (sessions, groups, ownership of mobs, passwor
 The mod's code is under the [MIT license](LICENSE). BepInEx, LiteNetLib and Steamworks.NET keep their own licenses.
 
 ## Changelog
+- **Unreleased:**
+  - A long session no longer keeps growing: a cast glow whose stop never arrived, entries for players, bots and group
+    frames that left the scene, a finished session's loot and dungeon-finder state, and the bookkeeping of mobs this
+    machine no longer runs are dropped when they are no longer needed.
+  - Less work per frame: the HUD feed, the player's own reported look and the dungeon's place name are built only when
+    they change, and status marks on group frames no longer pile up when the game rebuilds those frames.
 - **0.7.1:**
   - Internal cleanup, with no behaviour change: the host's join checks (protocol, game build, password, ban list, an
     already-connected peer and a full session) now live in their own class. Everyone needs the same version to play

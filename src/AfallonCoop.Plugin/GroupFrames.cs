@@ -20,6 +20,8 @@ internal static class GroupFrames
         if (slots == null) return;
         int used = ui.activeCompanions != null ? ui.activeCompanions.Count : 0;
         try { var w = BLINK.RPGBuilder.Challenges.ChallengeStoneParty.Waiting; if (w != null) used += w.Count; } catch { }
+        // The frames are the game's and it rebuilds them (new slot graphics, new addresses): drop marks keyed by the old ones.
+        MarkSeen.Clear();
         for (int i = 0; i < slots.Count; i++) Overlay(slots[i], null); // the game re-inits frames: our marks go
         FarSlots.Clear();
         var s = CoopManager.Session;
@@ -54,6 +56,12 @@ internal static class GroupFrames
                 if (mem.Online && far.thisCG != null) FarSlots[far.thisCG.Pointer] = mem.Id;
             }
         }
+
+        // The frames are the game's and it rebuilds them (new slot graphics, new addresses): drop marks keyed by the old
+        // ones (MarkSeen holds the slots this fill went over).
+        MarkStale.Clear();
+        foreach (var key in Marks.Keys) if (!MarkSeen.Contains(key)) MarkStale.Add(key);
+        foreach (var key in MarkStale) Marks.Remove(key);
     }
 
     // A far member's frame has no entity for the game's own click (CompanionSlotClickHandler polls the mouse over its
@@ -106,12 +114,16 @@ internal static class GroupFrames
     }
 
     private static readonly Dictionary<IntPtr, TMPro.TextMeshProUGUI> Marks = new();
+    // Reused when dropping marks for slots the game has rebuilt (their old graphics, and the keys, would stay forever).
+    private static readonly HashSet<IntPtr> MarkSeen = new();
+    private static readonly List<IntPtr> MarkStale = new();
 
     /// <summary>A status mark over the portrait ("OFFLINE" in red, like WoW's disconnect icon), or none.</summary>
     private static void Overlay(CompanionDisplayManager.CompanionUISlot slot, string status)
     {
         if (slot?.thisCG == null) return;
         var key = slot.thisCG.Pointer;
+        MarkSeen.Add(key); // still a live slot: its mark stays (Fill drops the keys of the others)
         Marks.TryGetValue(key, out var mark);
         if (status == null) { if (mark != null) mark.gameObject.SetActive(false); return; }
         if (mark == null)
