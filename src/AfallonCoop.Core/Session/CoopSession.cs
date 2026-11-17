@@ -24,6 +24,7 @@ public sealed class CoopSession : IDisposable
     private readonly Outbox _outbox;
     private readonly PlayerKeys _playerKeys = new();
     private readonly PauseController _pause = new();
+    private readonly JoinPolicy _joinPolicy;
     private readonly SessionLeases _leases;
     private readonly SessionGroups _groups;
     private readonly ReturnPlaces _returnPlaces = new();
@@ -79,6 +80,7 @@ public sealed class CoopSession : IDisposable
         _clock = clock;
         IsHost = isHost;
         _outbox = new Outbox(transport, _peers, isHost);
+        _joinPolicy = new JoinPolicy(config, (steamId, clientId) => IsBanned?.Invoke(steamId, clientId) == true);
         _hostHandlers = CreateHostHandlers();
         _clientHandlers = CreateClientHandlers();
         _leases = new SessionLeases(_outbox, clock, isHost, () => LocalId, () => State == SessionState.Connected,
@@ -526,7 +528,7 @@ public sealed class CoopSession : IDisposable
     private void HostAccept(int connection, HelloMsg hello)
     {
         _peers.StopAwaitingHello(connection);
-        string rejection = RejectionReason(connection, hello);
+        string rejection = _joinPolicy.RejectionReason(hello, _peers.Has(connection), Players.Count);
         if (rejection != null)
         {
             Reject(connection, hello, rejection);
@@ -542,31 +544,6 @@ public sealed class CoopSession : IDisposable
         WritePauseState();
         _outbox.To(connection, Delivery.Reliable);
     }
-
-    private string RejectionReason(int connection, HelloMsg hello)
-    {
-        if (hello.Protocol != ProtocolInfo.Version)
-            return $"Mod protocol mismatch (host {ProtocolInfo.Version}, you {hello.Protocol}). Update the mod.";
-        if (IsGameBuildMismatch(hello))
-            return "Different game version than the host. Both players must update Afallon.";
-        if (IsPasswordWrong(hello))
-            return string.IsNullOrEmpty(hello.Password) ? "This game has a password: enter it under CO-OP > JOIN GAME." : "Wrong password.";
-        if (IsBanned?.Invoke(hello.SteamId, hello.ClientId) == true)
-            return "The host has banned you from this game.";
-        if (_peers.Has(connection))
-            return "Already connected.";
-        if (Players.Count >= ProtocolInfo.MaxPlayers)
-            return $"Session is full ({ProtocolInfo.MaxPlayers} players).";
-        return null;
-    }
-
-    private bool IsGameBuildMismatch(HelloMsg hello) =>
-        !string.IsNullOrEmpty(_config.GameBuild)
-        && !string.IsNullOrEmpty(hello.GameBuild)
-        && hello.GameBuild != _config.GameBuild;
-
-    private bool IsPasswordWrong(HelloMsg hello) =>
-        !string.IsNullOrEmpty(_config.Password) && hello.Password != _config.Password;
 
     private void Reject(int connection, HelloMsg hello, string reason)
     {
