@@ -223,6 +223,8 @@ internal static class StateSync
     }
 
     private static string _sentStates = "";
+    private static readonly System.Collections.Generic.List<Wire> MirroredNow = new(); // reused every pass
+    private static readonly System.Text.StringBuilder StatesSignature = new();
     private static float _nextStates, _nextCheck;
 
     public static void Update()
@@ -232,17 +234,20 @@ internal static class StateSync
         _nextCheck = Time.unscaledTime + 0.25f;
         KeepForms();
         SendMobStates();
-        var list = new System.Collections.Generic.List<Wire>();
+        var list = MirroredNow;
+        list.Clear();
         var states = me.GetStates();
         if (states != null) foreach (var st in states) if (st != null && st.stateEffect != null && Mirrored(st.stateEffect)) list.Add(Wire.Of(st));
         list.Sort((a, b) => a.Id.CompareTo(b.Id));
         long form = MobSync.FormCode(me); // an animal form travels with the states: shown on the puppet elsewhere
         long mounted = MobSync.MountCode(me); // and a mount
-        var sig = new System.Text.StringBuilder();
+        var sig = StatesSignature;
+        sig.Clear();
         foreach (var w in list) sig.Append(w.Id).Append(':').Append(w.Rank).Append(':').Append(w.Stack).Append(',');
         sig.Append('|').Append(form).Append('|').Append(mounted);
-        if (sig.ToString() == _sentStates && Time.unscaledTime < _nextStates) return;
-        _sentStates = sig.ToString();
+        string signature = sig.ToString();
+        if (signature == _sentStates && Time.unscaledTime < _nextStates) return;
+        _sentStates = signature;
         T("send my list " + _sentStates);
         _nextStates = Time.unscaledTime + 5f;
         W.Reset(); W.U8(KindPlayerStates); W.U8((byte)Math.Min(list.Count, 255));

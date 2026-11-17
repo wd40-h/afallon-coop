@@ -10,7 +10,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>AfallonCoop.Plugin</RootNamespace>
     <AssemblyName>AfallonCoop</AssemblyName>
-    <Version>0.7.1</Version>
+    <Version>0.8.0</Version>
     <!-- Path to the game; override with -p:GameDir=... -->
     <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Afallon</GameDir>
     <BepInExDir>$(GameDir)\BepInEx</BepInExDir>
@@ -73,7 +73,7 @@
     </PropertyGroup>
     <RemoveDir Directories="$(PackageDir)" />
     <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(PackageDir)BepInEx\plugins\AfallonCoop" />
-    <Copy SourceFiles="..\..\README.md" DestinationFolder="$(PackageDir)" />
+    <Copy SourceFiles="..\..\README.md;..\..\CHANGELOG.md" DestinationFolder="$(PackageDir)" />
     <MakeDir Directories="$(MSBuildProjectDirectory)\..\..\dist" />
     <ZipDirectory SourceDirectory="$(PackageDir)" DestinationFile="$(PackageZip)" Overwrite="true" />
     <Message Importance="high" Text="Mod archive: $(PackageZip)" />

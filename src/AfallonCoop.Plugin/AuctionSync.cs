@@ -319,6 +319,18 @@ internal static class AuctionSync
         Send();
     }
 
+    private static (DateTime written, long length) _pendingStamp;
+    private static string[] _pendingLines = Array.Empty<string>();
+
+    /// <summary>The kept mail's lines; the file is read again only when it changed (this runs every few seconds).</summary>
+    private static string[] PendingLines()
+    {
+        var info = new FileInfo(PendingFile);
+        var stamp = (info.LastWriteTimeUtc, info.Length);
+        if (stamp != _pendingStamp) { _pendingLines = File.ReadAllLines(PendingFile); _pendingStamp = stamp; }
+        return _pendingLines;
+    }
+
     /// <summary>Host: kept mail to its players who are in the world now (until they acknowledge it).</summary>
     private static void DeliverWaiting()
     {
@@ -326,7 +338,7 @@ internal static class AuctionSync
         {
             if (!File.Exists(PendingFile)) return;
             var s = CoopManager.Session;
-            foreach (var l in File.ReadAllLines(PendingFile))
+            foreach (var l in PendingLines())
             {
                 var f = l.Split('	');
                 if (f.Length < 7) continue;
@@ -463,7 +475,7 @@ internal static class AuctionSync
     {
         var m = Market;
         if (m != null && _own != null) try { m.State.Listings = _own; m.Revision = m.Revision + 1; } catch { }
-        _own = null; _mirror = null; _hostClockAt = -1f; Names.Clear(); Owners.Clear(); _ownersFor = null; _sentRevision = int.MinValue; _browsing = false; Browsing.Clear(); SentAt.Clear();
+        _own = null; _mirror = null; _hostClockAt = -1f; Names.Clear(); Owners.Clear(); _ownersFor = null; _sentRevision = int.MinValue; _browsing = false; Browsing.Clear(); SentAt.Clear(); _pendingStamp = default; _pendingLines = Array.Empty<string>();
     }
 
     private static bool _saving;

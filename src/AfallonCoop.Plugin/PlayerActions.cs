@@ -151,6 +151,7 @@ internal static class PlayerActions
     }
     private static string _pose = "";
     private static readonly Dictionary<byte, byte> Rides = new();      // others: rider -> the player carrying them
+    private static readonly List<byte> StaleRides = new(); // reused every frame
     private static readonly Dictionary<byte, Transform> SeatedOn = new(); // others: rider -> the bone their puppet hangs on
 
     /// <summary>A puppet hanging on an animal: its stream does not move it.</summary>
@@ -486,9 +487,9 @@ internal static class PlayerActions
         }
         var s = CoopManager.Session;
         if (Rides.Count == 0 && SeatedOn.Count == 0) return;
-        var gone = new List<byte>();
-        foreach (var kv in Rides) if (s == null || !s.Players.ContainsKey(kv.Key) || !s.Players.ContainsKey(kv.Value)) gone.Add(kv.Key);
-        foreach (var id in gone) { Rides.Remove(id); GivenSeats.Remove(id); GivenApplied.Remove(id); Unseat(id); }
+        StaleRides.Clear();
+        foreach (var kv in Rides) if (s == null || !s.Players.ContainsKey(kv.Key) || !s.Players.ContainsKey(kv.Value)) StaleRides.Add(kv.Key);
+        foreach (var id in StaleRides) { Rides.Remove(id); GivenSeats.Remove(id); GivenApplied.Remove(id); Unseat(id); }
         // riders hung on their animals here, as soon as both are here
         if (_rideOn && Time.unscaledTime >= _nextSeat && _nextSeat > 0f) SendSeat(); // for whoever came later
         foreach (var kv in Rides)
