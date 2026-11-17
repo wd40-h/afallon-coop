@@ -7,15 +7,14 @@ namespace AfallonCoop.Tests;
 /// <summary>Player groups over a real session: invites, the limit of 5 with bot companions, leaders, leaving.</summary>
 public class GroupTests
 {
-    private double _now;
-    private double Clock() => _now;
+    private static double Clock() => 0;
 
-    private static SessionConfig Cfg(string name, string id = null) => new() { ModVersion = "0.1", GameBuild = "B1", PlayerName = name, ClientId = id ?? name };
+    private static SessionConfig Cfg(string name, string? id = null) => new() { ModVersion = "0.1", GameBuild = "B1", PlayerName = name, ClientId = id ?? name };
 
     private sealed class Net
     {
         public readonly LoopbackHub Hub = new();
-        public CoopSession Host;
+        public CoopSession Host = null!;
         public readonly List<CoopSession> Clients = new();
         public IEnumerable<CoopSession> All => Clients.Prepend(Host);
         public void Pump(int rounds = 6) { for (int i = 0; i < rounds; i++) foreach (var s in All) s.Tick(); }

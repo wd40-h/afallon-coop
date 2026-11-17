@@ -15,7 +15,7 @@ public class SessionTests
     private sealed class Net
     {
         public readonly LoopbackHub Hub = new();
-        public CoopSession Host;
+        public CoopSession Host = null!;
         public readonly List<CoopSession> Clients = new();
 
         public void Pump(int rounds = 6)
@@ -28,7 +28,7 @@ public class SessionTests
         }
     }
 
-    private Net Start(int clients, Func<int, SessionConfig> cfg = null)
+    private Net Start(int clients, Func<int, SessionConfig>? cfg = null)
     {
         var n = new Net();
         n.Host = CoopSession.StartHost(n.Hub.Host, Cfg("Host"), Clock);
@@ -104,7 +104,7 @@ public class SessionTests
     public void Client_cannot_spoof_another_players_id()
     {
         var n = Start(2);
-        PlayerStateMsg seen = null;
+        PlayerStateMsg? seen = null;
         n.Clients[1].StateReceived += m => seen = m;
         var w = new NetWriter();
         new PlayerStateMsg { Id = 0, Seq = 1 }.Write(w); // pretend to be the host
@@ -152,7 +152,7 @@ public class SessionTests
     {
         var n = Start(2);
         n.Host.Dispose();
-        n.Host = null;
+        n.Host = null!;
         n.Pump();
         Assert.All(n.Clients, c => Assert.Equal(SessionState.Closed, c.State));
         Assert.All(n.Clients, c => Assert.Contains("Host left", c.Status));

@@ -17,7 +17,7 @@ public class SessionLeaseTests
     private sealed class Net
     {
         public readonly LoopbackHub Hub = new();
-        public CoopSession Host;
+        public CoopSession Host = null!;
         public readonly List<CoopSession> Clients = new();
         public IEnumerable<CoopSession> All => Clients.Prepend(Host);
 

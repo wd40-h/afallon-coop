@@ -12,7 +12,7 @@ public class PauseTests
     private sealed class Net
     {
         public readonly LoopbackHub Hub = new();
-        public CoopSession Host;
+        public CoopSession Host = null!;
         public readonly List<CoopSession> Clients = new();
         public IEnumerable<CoopSession> All => Clients.Prepend(Host);
         public void Pump() { for (int i = 0; i < 8; i++) { Host.Tick(); foreach (var c in Clients) c.Tick(); } }
