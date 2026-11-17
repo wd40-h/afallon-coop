@@ -27,10 +27,7 @@ public sealed class CoopSession : IDisposable
     private readonly PauseController _pause = new();
     private readonly GroupDirectory _groups = new();
     private readonly GroupRegistry _groupRegistry = new();
-    private readonly LeaseRegistry _leases = new();
-    private readonly LeaseView _leaseView = new();
-    private readonly HashSet<uint> _interest = new();
-    private readonly Dictionary<uint, bool> _leaseCombat = new();
+    private readonly SessionLeases _leases;
     private readonly ReturnPlaces _returnPlaces = new();
     private readonly Dictionary<MsgType, HostHandler> _hostHandlers;
     private readonly Dictionary<MsgType, ClientHandler> _clientHandlers;
@@ -87,8 +84,9 @@ public sealed class CoopSession : IDisposable
         _outbox = new Outbox(transport, _peers, isHost);
         _hostHandlers = CreateHostHandlers();
         _clientHandlers = CreateClientHandlers();
-        _leases.HostId = ProtocolInfo.HostId;
-        _leases.OwnerChanged += OnLeaseOwnerChanged;
+        _leases = new SessionLeases(_outbox, clock, isHost, () => LocalId, () => State == SessionState.Connected,
+            message => Log?.Invoke(message));
+        _leases.Changed += (key, owner, epoch) => LeaseChanged?.Invoke(key, owner, epoch);
         ListenToGroupRegistry();
         _transport.Connected += OnConnected;
         _transport.Disconnected += OnDisconnected;
@@ -146,7 +144,7 @@ public sealed class CoopSession : IDisposable
         if (State == SessionState.Closed) return;
         _transport.Poll();
         if (!IsHost) return;
-        _leases.Tick(_clock());
+        _leases.Tick();
         foreach (var connection in _peers.TakeTimedOutHandshakes(_clock()))
             _transport.Disconnect(connection, "handshake timeout");
     }
@@ -302,78 +300,15 @@ public sealed class CoopSession : IDisposable
     }
 
     /// <summary>Who simulates spawner <paramref name="key"/>; <see cref="LeaseRegistry.NoOwner"/> if nobody or unknown yet.</summary>
-    public byte LeaseOwner(uint key) => _leaseView.OwnerOf(key);
-    public int LeaseCount => _leaseView.Count;
+    public byte LeaseOwner(uint key) => _leases.OwnerOf(key);
+    public int LeaseCount => _leases.Count;
 
     /// <summary>The local player came near spawner <paramref name="key"/> (or left it). The host assigns an owner.</summary>
     /// <param name="leftPlace">Not near any more because this player left the scene or dungeon instance: the spawner's
     /// mobs are gone on this machine, so a fight cannot stay with it; the lease moves at once.</param>
-    public void SetInterest(uint key, bool near, bool leftPlace = false)
-    {
-        bool changed = near ? _interest.Add(key) : _interest.Remove(key);
-        if (!changed) return;
-        if (IsHost) ReportHostInterest(key, near, leftPlace);
-        else if (State == SessionState.Connected) SendInterest(key, near, leftPlace);
-    }
+    public void SetInterest(uint key, bool near, bool leftPlace = false) => _leases.SetInterest(key, near, leftPlace);
 
-    private void ReportHostInterest(uint key, bool near, bool leftPlace)
-    {
-        if (near) _leases.Subscribe(LocalId, FormatLeaseKey(key), _clock());
-        else _leases.Unsubscribe(LocalId, FormatLeaseKey(key), _clock(), leftPlace);
-    }
-
-    private void SendInterest(uint key, bool near, bool leftPlace = false)
-    {
-        var writer = _outbox.Begin(MsgType.Interest);
-        writer.U32(key);
-        writer.Bool(near);
-        writer.Bool(leftPlace);
-        _outbox.ToHost(Delivery.Reliable);
-    }
-
-    /// <summary>Owner side: is anything from this spawner fighting (ownership does not move during a fight).</summary>
-    public void ReportLeaseCombat(uint key, bool inCombat)
-    {
-        if (_leaseCombat.TryGetValue(key, out var wasInCombat) && wasInCombat == inCombat) return;
-        _leaseCombat[key] = inCombat;
-        if (IsHost) _leases.SetCombat(LocalId, FormatLeaseKey(key), inCombat, _clock());
-        else if (State == SessionState.Connected) SendLeaseCombat(key, inCombat);
-    }
-
-    private void SendLeaseCombat(uint key, bool inCombat)
-    {
-        var writer = _outbox.Begin(MsgType.LeaseCombat);
-        writer.U32(key);
-        writer.Bool(inCombat);
-        _outbox.ToHost(Delivery.Reliable);
-    }
-
-    private void OnLeaseOwnerChanged(LeaseRegistry.Lease lease, string reason)
-    {
-        uint key = Convert.ToUInt32(lease.Key, 16);
-        string owner = lease.Owner == LeaseRegistry.NoOwner ? "none" : "#" + lease.Owner;
-        Log?.Invoke($"Spawner {lease.Key}: owner {owner} ({reason})");
-        WriteLeaseOwner(key, lease.Owner, lease.Epoch);
-        _outbox.ToEveryone(Delivery.Reliable);
-        ApplyLeaseOwner(key, lease.Owner, lease.Epoch);
-    }
-
-    private void WriteLeaseOwner(uint key, byte owner, uint epoch)
-    {
-        var writer = _outbox.Begin(MsgType.LeaseOwner);
-        writer.U32(key);
-        writer.U8(owner);
-        writer.U32(epoch);
-    }
-
-    private void ApplyLeaseOwner(uint key, byte owner, uint epoch)
-    {
-        if (!_leaseView.TryUpdate(key, owner, epoch)) return;
-        if (owner != LocalId) _leaseCombat.Remove(key);
-        LeaseChanged?.Invoke(key, owner, epoch);
-    }
-
-    private static string FormatLeaseKey(uint key) => key.ToString("x8");
+    public void ReportLeaseCombat(uint key, bool inCombat) => _leases.ReportCombat(key, inCombat);
 
     public void GroupInvite(byte target) => RequestGroupOp(GroupOp.Invite, w => w.U8(target));
     public void GroupAnswer(bool accept) => RequestGroupOp(GroupOp.Answer, w => w.Bool(accept));
@@ -592,7 +527,7 @@ public sealed class CoopSession : IDisposable
     {
         if (!Players.Remove(id, out var info)) return;
         _pause.Forget(id);
-        _leases.PlayerLeft(id, _clock());
+        _leases.PlayerLeft(id);
         _returnPlaces.SaveForReturn(id, _playerKeys.Of(info));
         _groupRegistry.PlayerOffline(id);
         _playerKeys.Release(id);
@@ -711,20 +646,11 @@ public sealed class CoopSession : IDisposable
         _outbox.To(targetConnection, Delivery.UnreliableUnordered);
     }
 
-    private void OnInterestFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
-    {
-        string key = FormatLeaseKey(reader.U32());
-        bool near = reader.Bool();
-        bool leftPlace = reader.Remaining > 0 && reader.Bool();
-        if (near) _leases.Subscribe(sender, key, _clock());
-        else _leases.Unsubscribe(sender, key, _clock(), leftPlace);
-    }
+    private void OnInterestFromPeer(MsgType type, int connection, byte sender, ref NetReader reader) =>
+        _leases.OnInterestFromPeer(sender, ref reader);
 
-    private void OnLeaseCombatFromPeer(MsgType type, int connection, byte sender, ref NetReader reader)
-    {
-        string key = FormatLeaseKey(reader.U32());
-        _leases.SetCombat(sender, key, reader.Bool(), _clock());
-    }
+    private void OnLeaseCombatFromPeer(MsgType type, int connection, byte sender, ref NetReader reader) =>
+        _leases.OnCombatFromPeer(sender, ref reader);
 
     private void OnGroupOpFromPeer(MsgType type, int connection, byte sender, ref NetReader reader) =>
         HostGroupOp(sender, (GroupOp)reader.U8(), ref reader);
@@ -844,11 +770,7 @@ public sealed class CoopSession : IDisposable
 
     private void SendCurrentWorldState(int connection)
     {
-        foreach (var entry in _leaseView.Entries)
-        {
-            WriteLeaseOwner(entry.Key, entry.Value.owner, entry.Value.epoch);
-            _outbox.To(connection, Delivery.Reliable);
-        }
+        _leases.SendCurrentOwners(connection);
         WriteGroupState();
         _outbox.To(connection, Delivery.Reliable);
     }
@@ -896,7 +818,7 @@ public sealed class CoopSession : IDisposable
     private void ReportStateKnownBeforeWelcome()
     {
         SendMenuStateToHost(_localMenuOpen);
-        foreach (var key in _interest) SendInterest(key, near: true);
+        _leases.ResendInterest();
         if (_reportedBots <= 0) return;
         int bots = _reportedBots;
         _reportedBots = BotCountUnknown;
@@ -911,12 +833,7 @@ public sealed class CoopSession : IDisposable
         if (isKnownRemotePlayer) RaisePayloadReceived(type, sender, payload);
     }
 
-    private void OnLeaseOwner(MsgType type, ref NetReader reader)
-    {
-        uint key = reader.U32();
-        byte owner = reader.U8();
-        ApplyLeaseOwner(key, owner, reader.U32());
-    }
+    private void OnLeaseOwner(MsgType type, ref NetReader reader) => _leases.OnOwnerAnnounced(ref reader);
 
     private void OnPauseState(MsgType type, ref NetReader reader)
     {
